@@ -1,0 +1,9 @@
+# Local toolchain (SBCL, vendored deps, ASDF fasl cache) — sandbox-only bootstrap
+.tools/
+*.fasl
+# Common Lisp editor droppings
+*.abcl
+*.cfsl
+*.fas
+*.lx64fsl
+*.lisp~
