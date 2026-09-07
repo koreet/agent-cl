@@ -36,9 +36,8 @@
   "Current UTC time as ISO-8601-ish string (second precision)."
   (multiple-value-bind (sec min hour day month year)
       (decode-universal-time (get-universal-time) 0)
-    (declare (ignore sec))
-    (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:00Z"
-            year month day hour min)))
+    (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0dZ"
+            year month day hour min sec)))
 
 (defparameter *ascii-per-token* 4.0
   "Rough tokens-per-char heuristic for non-CJK text.")
@@ -56,6 +55,17 @@
                      (incf cjk)
                      (incf ascii)))
         (round (+ (/ cjk *cjk-per-token*) (/ ascii *ascii-per-token*))))))
+
+(defun utf8-byte-length (text)
+  "Number of bytes TEXT occupies when written as UTF-8 (chars may be 1-4 bytes)."
+  (if (null text)
+      0
+      (loop for ch across text
+            for code = (char-code ch)
+            sum (cond ((< code #x80) 1)
+                      ((< code #x800) 2)
+                      ((< code #x10000) 3)
+                      (t 4)))))
 
 (defun read-file-string (path &key (external-format :utf-8))
   (uiop:read-file-string path :external-format external-format))

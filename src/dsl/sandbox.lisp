@@ -45,14 +45,15 @@
   (member (symbol-name sym) names :test #'string-equal))
 
 (defun allowed-symbol-p (sym)
-  "Callable when its name is whitelisted (any package) or it is a plain CL
-  function; never when it can reach I/O or evaluation."
+  "Callable only when its name is on the explicit whitelist (any package; the
+  name is then resolved package-agnostically, see RESOLVE-FN). Everything else
+  is denied: the whitelist is the single gate, so no CL function outside it —
+  sleep/read-line/print/symbol-value/directory/… — is ever reachable, which is
+  what the file header promises."
   (and (not (name-in sym *dsl-blacklist-names*))
        (not (macro-function sym))
        (not (special-operator-p sym))
-       (or (name-in sym (mapcar #'symbol-name *dsl-command-whitelist*))
-           (and (eq (symbol-package sym) (find-package :cl))
-                (fboundp sym)))))
+       (name-in sym (mapcar #'symbol-name *dsl-command-whitelist*))))
 
 (defun resolve-fn (sym)
   "Resolve SYM to a function object, falling back to the CL symbol of the

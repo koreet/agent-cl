@@ -141,6 +141,22 @@
     (with-dsl-sandbox ()
       (dsl-eval-safe '(open "/etc/passwd")))))
 
+(deftest dsl-sandbox-rejects-cl-escape-hatches
+  ;; Regression: the whitelist gate must not be bypassable through arbitrary
+  ;; fbound CL functions (sleep/read-line/print/symbol-value/directory/...).
+  (signals-error agent-cl.core:dsl-error
+    (with-dsl-sandbox ()
+      (dsl-eval-safe '(sleep 1))))
+  (signals-error agent-cl.core:dsl-error
+    (with-dsl-sandbox ()
+      (dsl-eval-safe '(print "hi"))))
+  (signals-error agent-cl.core:dsl-error
+    (with-dsl-sandbox ()
+      (dsl-eval-safe '(symbol-value 'cl:*standard-output*))))
+  (signals-error agent-cl.core:dsl-error
+    (with-dsl-sandbox ()
+      (dsl-eval-safe '(directory "/")))))
+
 (deftest dsl-sandbox-step-limit
   (signals-error agent-cl.core:dsl-error
     (with-dsl-sandbox (:max-steps 10)
@@ -149,3 +165,34 @@
                                   (list (list 5 6) (list 7 8)))
                             (list (list (list 9 10) (list 11 12))
                                   (list (list 13 14) (list 15 16))))))))
+
+;; ---------------------------------------------------------------------------
+;; regression: snake_case property validation + array :items declaration
+;; ---------------------------------------------------------------------------
+
+(deftest schema-snake-case-underscore-property
+  ;; "max_steps" decodes to :MAX-STEPS; the validator must use the same key
+  ;; normalization or required fields are wrongly reported missing.
+  (let ((schema (make-schema
+                 :kind :object
+                 :properties (list (cons "max_steps" (list :type :number))
+                                   (cons "user_id" (list :type :string)))
+                 :required '("max_steps" "user_id"))))
+    (ok (json-valid-p
+         schema (decode-to-plist
+                 "{\"max_steps\": 5, \"user_id\": \"abc\"}")))
+    (ok (not (json-valid-p
+              schema (decode-to-plist "{\"user_id\": \"abc\"}"))))
+    ;; type check actually applies (string in a :number slot is caught)
+    (ok (not (json-valid-p
+              schema (decode-to-plist
+                      "{\"max_steps\": \"not-a-number\", \"user_id\": \"abc\"}"))))))
+
+(deftest schema-array-items-typed
+  ;; (defschema (:array (item :number ...))) must produce a typed array schema,
+  ;; not silently default every element to :string.
+  (let* ((schema (parse-schema-decl '(:array (x :number))))
+         (wire (json-decode (schema->json-string schema))))
+    (is-equal "number" (gethash "type" (gethash "items" wire)))
+    (ok (json-valid-p schema (list 1 2 3)))
+    (ok (not (json-valid-p schema (list 1 "two"))))))

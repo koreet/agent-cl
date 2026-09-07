@@ -23,7 +23,10 @@
       (when e (setf spec (append spec (list :enum (copy-list e))))))
     (let ((items (getf opts :items)))
       (when items
-        (setf spec (append spec (list :items (decl->prop items))))))
+        ;; :items expects a *spec plist* (no property name); decl->prop returns
+        ;; (name . spec), so take the cdr or downstream getf/validation misreads
+        ;; the element name as the first plist key and loses the type.
+        (setf spec (append spec (list :items (cdr (decl->prop items)))))))
     (let ((props (getf opts :properties)))
       (when props
         (setf spec (append spec (list :properties (mapcar #'decl->prop props))))))
@@ -82,7 +85,7 @@
       (:array
        (agent-cl.schema:make-schema
         :kind :array
-        :items (decl->prop (second decl))))
+        :items (cdr (decl->prop (second decl)))))
       (:string (agent-cl.schema:make-schema :kind :string))
       (:number (agent-cl.schema:make-schema :kind :number))
       (:boolean (agent-cl.schema:make-schema :kind :boolean))

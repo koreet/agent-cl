@@ -117,14 +117,26 @@
 ;;; validation of decoded JSON (plist structures) against a schema
 ;;; ---------------------------------------------------------------------------
 
+(defun norm-property-key (name)
+  "Normalize a schema property name (string or symbol) to the canonical
+  dotted-keyword form used by decoded JSON plists. JSON snake_case keys are
+  decoded to kebab-case keywords by core/json (e.g. \"max_steps\" -> :MAX-STEPS),
+  so schema property names must follow the same rule or validation silently
+  misses underscores names (required always reported missing, type checks
+  skipped)."
+  (let* ((s (if (symbolp name) (symbol-name name) name))
+         (kebab (substitute #\- #\_ s)))
+    (intern (string-upcase kebab) :keyword)))
+
 (defun prop-key (name)
   "Schema property name (usually a string) -> expected decoded plist keyword."
-  (intern (string-upcase (if (symbolp name) (symbol-name name) name)) :keyword))
+  (norm-property-key name))
 
 (defun find-prop (schema name)
   (assoc (if (symbolp name) (symbol-name name) name)
          (schema-properties schema)
-         :test (lambda (a b) (string-equal (string a) (string b)))))
+         :test (lambda (a b) (string-equal (norm-property-key a)
+                                           (norm-property-key b)))))
 
 (defun spec->schema (spec)
   "Promote a property spec plist to a schema for validation (arrays/objects)."
@@ -167,7 +179,7 @@
       (when (and props (listp value))
         (let ((sub (make-schema :kind :object :properties props
                                 :required (getf spec :required))))
-          (validate-object sub value path problems))))
+          (setf problems (validate-object sub value path problems)))))
     problems))
 
 (defmethod validate-object ((schema schema) value path problems)
@@ -184,8 +196,10 @@
         for prop = (find-prop schema
                               (if (keywordp k) (string-downcase (symbol-name k)) k))
         when prop
-          do (validate-value (cdr prop) v
-                             (format nil "~a.~a" path (car prop)) problems))
+          do (setf problems
+                   (validate-value (cdr prop) v
+                                   (format nil "~a.~a" path (car prop))
+                                   problems)))
   problems)
 
 (defun validate-json (schema decoded)

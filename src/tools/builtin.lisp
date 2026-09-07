@@ -69,7 +69,9 @@
     (handler-case
         (progn
           (agent-cl.core:write-file-string path content)
-          (values (format nil "wrote ~a bytes to ~a" (length content) path) :ok))
+          (values (format nil "wrote ~a bytes to ~a"
+                          (agent-cl.core:utf8-byte-length content) path)
+                  :ok))
       (error (e) (values (format nil "cannot write ~a: ~a" path e) :error)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -186,14 +188,18 @@
       (return-from delegate-task (values "missing :task" :error)))
     (flet ((norm (n) (if (stringp n) n (string-downcase (string n)))))
       (let* ((inherited (agent-cl.loop:agent-tools parent))
+             ;; remove BOTH the DSL name (task.delegate) and the wire name
+             ;; (task_delegate) — the model sees the sanitized wire name, so a
+             ;; literal-name filter alone would let nesting slip through.
              (child-tools
-               (remove "task.delegate"
-                       (if explicit
-                           (mapcar #'norm explicit)
-                           (if (eq inherited :all)
-                               (agent-cl.tools:list-tools)
-                               (mapcar #'norm inherited)))
-                       :test #'string=)))
+               (remove-if (lambda (n)
+                            (member (norm n) '("task.delegate" "task_delegate")
+                                    :test #'string=))
+                          (if explicit
+                              (mapcar #'norm explicit)
+                              (if (eq inherited :all)
+                                  (agent-cl.tools:list-tools)
+                                  (mapcar #'norm inherited))))))
         (let* ((child (agent-cl.loop:make-agent
                        :transport (agent-cl.loop:agent-transport parent)
                        :model model

@@ -95,14 +95,16 @@
                 (error 'agent-cl.core:transport-error
                        :message (format nil "http ~a: ~a" st bt)
                        :status st
-                       :retryable (>= st 500)))))))
+                       ;; 5xx and 429 (rate limit) are transient; 4xx are not
+                       :retryable (or (>= st 500) (= st 429))))))))
       (multiple-value-bind (body status)
           (apply post url args)
         (unless (<= 200 status 299)
           (error 'agent-cl.core:transport-error
                  :message (format nil "http ~a: ~a" status
                                   (http-body-text body))
-                 :status status :retryable (>= status 500)))
+                 :status status
+                 :retryable (or (>= status 500) (= status 429))))
         body))))
 
 (defun install-hook (pkg)

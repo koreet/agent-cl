@@ -123,6 +123,7 @@
                     (write-string (esc 0) out)
                     (when (< i n) (incf i)))     ; 跳过闭合反引号
                    (t (write-char (char text i) out) (incf i))))
+        (when bold (write-string (esc 0) out))   ; 未闭合 ** 也要复位，防终端残留加粗
         (get-output-stream-string out))))
 
 (defvar *md-state* :normal)
@@ -253,6 +254,24 @@
       (t (agent-cl.messages:make-message role
                                          :content (or (getf plist :CONTENT) ""))))))
 
+(defun sanitize-loaded-messages (msgs)
+  "载入的会话可能是被中断/截断导出的：去掉开头的孤立 :tool 消息与结尾的
+  悬空 assistant tool_calls（其后无 tool 结果），避免续谈时向 provider
+  发送非法消息序列（tool 无前置 assistant / assistant tool_calls 无结果）。
+  中间序列信任导出端（引擎保证配对）。"
+  ;; 1) drop leading orphan tool results
+  (let ((ms (loop for m in msgs
+                  while (eq (agent-cl.messages:msg-role m) :tool)
+                  finally (return msgs))))
+    ;; 2) drop a trailing assistant message that carries tool_calls but has no
+    ;; tool result after it (interrupted mid-turn export).
+    (let ((n (length ms)))
+      (if (and (plusp n)
+               (eq (agent-cl.messages:msg-role (nth (1- n) ms)) :assistant)
+               (agent-cl.messages:msg-tool-calls (nth (1- n) ms)))
+          (subseq ms 0 (1- n))
+          ms))))
+
 (defun import-transcript (agent path)
   (let (msgs)
     (with-open-file (i path :direction :input :external-format :utf-8)
@@ -261,7 +280,8 @@
             for trimmed = (string-trim '(#\Return #\Space) line)
             unless (string= trimmed "")
               do (push (wire->message (agent-cl.core:decode-to-plist trimmed)) msgs)))
-    (setf (agent-cl.loop:agent-messages agent) (nreverse msgs))
+    (setf msgs (sanitize-loaded-messages (nreverse msgs)))
+    (setf (agent-cl.loop:agent-messages agent) msgs)
     (format t "~&已载入 ~a 条消息~%" (length msgs))))
 
 (defun list-memory-keys ()
@@ -327,7 +347,14 @@
             (when (>= acc target) (return)))
           (let* ((kept (nreverse kept-rev))
                  (drop-n (- n (length kept))))
-            (when (plusp drop-n)
+            ;; 切割边界净化：若 kept 以孤立的 tool 结果开头（其 assistant
+            ;; tool-call 已被压进摘要），把这类 tool 也并入被压缩区，避免
+            ;; 下次请求以 :tool 消息开头 -> provider 400。
+            (loop while (and (plusp (length kept))
+                             (eq (agent-cl.messages:msg-role (first kept)) :tool))
+                  do (pop kept)
+                     (incf drop-n))
+            (when (and (plusp drop-n) kept)
               (let* ((drop (subseq msgs 0 drop-n))
                      (summary (summarize-in-child
                                agent (format nil "~{~a~%~}" (mapcar #'msg-line drop)))))
@@ -367,7 +394,13 @@
        (format t "~&当前 ~a tokens~%" (ctx-tokens agent)))
       ((string= cmd "/plan")
        (let ((f (and rest (find-symbol "RUN-PLANNED" "AGENT-CL.PLAN"))))
-         (if f (funcall f agent rest #'repl-on-token)
+         (if f
+             (handler-case
+                 (progn
+                   (funcall f agent rest #'repl-on-token)
+                   (flush-tokens))   ; 步骤流式残段此刻落屏，勿留到下一轮被 reset-tokens 丢弃
+               (error (e)
+                 (format t "~&[plan] 失败: ~a~%" e)))
              (format t "~&/plan 不可用：scripts/plan.lisp 未加载~%"))))
       ((string= cmd "/budget")
        (let ((v (and rest (ignore-errors (parse-integer rest)))))

@@ -8,10 +8,23 @@
 
 (in-package #:agent-cl.web)
 
+(defun pct-encode (s)
+  "Percent-encode a query string (UTF-8), leaving unreserved chars intact."
+  (with-output-to-string (out)
+    (loop for ch across s
+          for code = (char-code ch)
+          do (cond ((or (and (char<= #\a ch #\z))
+                        (and (char<= #\A ch #\Z))
+                        (and (char<= #\0 ch #\9))
+                        (member ch '(#\- #\_ #\. #\~)))
+                    (write-char ch out))
+                   (t (let ((b (sb-ext:string-to-octets (string ch) :external-format :utf-8)))
+                        (loop for x across b
+                              do (format out "%~2,'0X" x))))))))
+
 (defun ddg-url (query max)
   (declare (ignore max))
-  (format nil "https://html.duckduckgo.com/html/?q=~a"
-          (substitute #\+ #\Space query)))
+  (format nil "https://html.duckduckgo.com/html/?q=~a" (pct-encode query)))
 
 (defun html-entity-decode (s)
   (let ((out (make-string-output-stream)))
@@ -97,6 +110,9 @@
     (handler-case
         (let ((links (ddg-fetch-results query max)))
           (if links
-              (values (format nil "~{~a~%~}" links) :ok)
+              (values (format nil "~{~a - ~a~%~}"
+                              (loop for (t1 . u) in links
+                                    append (list t1 u)))
+                      :ok)
               (values "没有找到相关结果" :error)))
       (error (e) (values (format nil "检索失败: ~a" e) :error)))))

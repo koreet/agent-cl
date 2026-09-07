@@ -21,6 +21,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root  = $PSScriptRoot
+# 从任意目录启动都以仓库根为工作目录，REPL 里 /export、/load 的相对路径才稳定。
+Set-Location $root
 $offlineSbcl = Join-Path $root '.tools\sbcl\sbcl.exe'
 $keyFile = Join-Path $env:USERPROFILE '.agent-cl\api-key.txt'
 

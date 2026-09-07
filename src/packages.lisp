@@ -31,6 +31,7 @@
    #:uuid-string
    #:now-iso8601
    #:approx-tokens
+   #:utf8-byte-length
    #:ensure-list
    #:plist-get
    #:string-empty-p
@@ -71,6 +72,7 @@
    #:streaming-turn
    #:stream-feed #:stream-advance #:stream-drain #:stream-text
    #:stream-finished-p #:stream-finalize #:stream-usage #:stream-finish
+   #:stream-done-seen
    ;; --- wire codec ---
    #:encode-request-json #:encode-message-wire #:parse-chat-json
    #:usage-prompt-tokens #:usage-completion-tokens #:usage-total-tokens))
@@ -134,7 +136,7 @@
    #:schema->json-schema #:dsl-tool-schema #:find-schema #:parse-schema-decl
    ;; safe evaluation (D2: disabled by default)
    #:*dsl-execution-mode* #:*dsl-command-whitelist* #:*dsl-max-steps* #:*dsl-max-result-chars*
-   #:dsl-eval-safe #:sandbox-policy
+   #:dsl-eval-safe
    #:with-dsl-sandbox))
 
 (defpackage #:agent-cl.session

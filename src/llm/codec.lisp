@@ -125,10 +125,16 @@
   (let ((wire (agent-cl.core:decode-to-plist json-string)))
     (let* ((choices (getf wire :CHOICES))
            (first (first choices))
-           (msg (getf first :MESSAGE))
-           (content (getf msg :CONTENT)))
-      (make-instance 'turn-result
-                     :content (and content (not (eq content :null)) content)
-                     :tool-calls (parse-tool-calls (getf msg :TOOL-CALLS))
-                     :finish-reason (getf first :FINISH-REASON)
-                     :usage (normalize-usage (getf wire :USAGE))))))
+           (msg (and first (getf first :MESSAGE))))
+      (unless first
+        ;; 2xx with zero choices is a provider anomaly, not a successful empty
+        ;; answer — report it so the engine never treats "nothing" as done.
+        (error 'agent-cl.core:transport-error
+               :message "provider returned no choices"
+               :retryable t))
+      (let ((content (getf msg :CONTENT)))
+        (make-instance 'turn-result
+                       :content (and content (not (eq content :null)) content)
+                       :tool-calls (parse-tool-calls (getf msg :TOOL-CALLS))
+                       :finish-reason (getf first :FINISH-REASON)
+                       :usage (normalize-usage (getf wire :USAGE)))))))

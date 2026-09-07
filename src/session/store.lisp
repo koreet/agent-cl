@@ -59,15 +59,27 @@
     event))
 
 (defun session-replay (session)
-  "Read all events back from disk as plists."
+  "Read all events back from disk as plists. A corrupt line (crash residue,
+  partial write, external edit) is skipped with a warning instead of aborting
+  the whole session replay."
   (let ((path (session-path session)))
     (when (uiop:file-exists-p path)
-      (loop for line in (uiop:split-string
-                         (agent-cl.core:read-file-string path)
-                         :separator '(#\Newline))
-            for trimmed = (string-trim '(#\Return #\Space) line)
-            unless (string= trimmed "")
-              collect (agent-cl.core:decode-to-plist trimmed)))))
+      (let ((bad 0)
+            (events nil))
+        (dolist (line (uiop:split-string
+                       (agent-cl.core:read-file-string path)
+                       :separator '(#\Newline)))
+          (let ((trimmed (string-trim '(#\Return #\Space) line)))
+            (unless (string= trimmed "")
+              (handler-case
+                  (push (agent-cl.core:decode-to-plist trimmed) events)
+                (error (e)
+                  (incf bad)
+                  (format t "~&[session] 跳过损坏事件行 (~a): ~a~%"
+                          bad (subseq trimmed 0 (min 80 (length trimmed)))))))))
+        (when (plusp bad)
+          (format t "~&[session] ~a 行损坏被跳过~%" bad))
+        (nreverse events)))))
 
 (defun save-checkpoint (session &optional note)
   "Record a checkpoint event (used by interrupt/resume flows)."

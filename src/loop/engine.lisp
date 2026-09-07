@@ -256,12 +256,18 @@
   "Validate + execute one tool call; returns (values content status).
   AGENT is passed as the tool context so tools (task.delegate etc.) can spawn
   child agents that inherit the same transport/credentials."
-  (let* ((name (agent-cl.messages:tool-call-name tc))
-         (args (agent-cl.messages:tool-call-arguments-plist tc)))
-    (multiple-value-bind (content status)
-        (agent-cl.tools:call-tool name args agent)
-      (values (truncate-content content (policy-max-tool-results policy))
-              status))))
+  (let* ((name (agent-cl.messages:tool-call-name tc)))
+    (handler-case
+        (let ((args (agent-cl.messages:tool-call-arguments-plist tc)))
+          (multiple-value-bind (content status)
+              (agent-cl.tools:call-tool name args agent)
+            (values (truncate-content content (policy-max-tool-results policy))
+                    status)))
+      (error (e)
+        ;; A malformed arguments JSON (truncated stream, model hallucination)
+        ;; must not crash the whole run; surface it as a tool error result so
+        ;; the transcript stays consistent and the model can retry.
+        (values (format nil "[tool arguments 解析失败: ~a]" e) :error)))))
 
 (defun drain-stream-turn (agent params on-token)
   "Run a streaming request and accumulate the turn, calling ON-TOKEN with text
@@ -278,6 +284,14 @@
                         (when (> (length text) prev)
                           (funcall on-token (subseq text prev))
                           (setf prev (length text))))))
+           ;; EOF without [DONE] and without a finish_reason means the stream
+           ;; was cut short (network drop / provider error): surface it instead
+           ;; of silently returning truncated text or half-parsed tool args.
+           (when (and (not (agent-cl.llm:stream-done-seen turn))
+                      (null (agent-cl.llm:stream-finish turn)))
+             (error 'agent-cl.core:transport-error
+                    :message "stream ended before [DONE] (connection dropped?)"
+                    :retryable t))
            (agent-cl.llm:stream-finalize turn))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -322,27 +336,31 @@
                   (let ((result (second outcome)))
                     (add-usage agent (agent-cl.llm:result-usage result))
                     (if (agent-cl.llm:result-tool-calls result)
-                        (let ((tcs (agent-cl.llm:result-tool-calls result)))
+                        (let* ((tcs (agent-cl.llm:result-tool-calls result))
+                               ;; In serial mode only the first call runs; record
+                               ;; only what we actually execute so the transcript
+                               ;; never holds a tool_call without its tool result
+                               ;; (an illegal sequence for OpenAI/DeepSeek -> 400).
+                               (to-run (if (policy-parallel-tools policy)
+                                           tcs
+                                           (subseq tcs 0 (min 1 (length tcs))))))
                           (setf (agent-messages agent)
                                 (append (agent-messages agent)
                                         (list (agent-cl.messages:assistant-message
                                                (or (agent-cl.llm:result-content result) "")
-                                               :tool-calls tcs))))
-                          (incf tool-count (length tcs))
-                          (let ((to-run (if (policy-parallel-tools policy)
-                                            tcs
-                                            (subseq tcs 0 (min 1 (length tcs))))))
-                            (dolist (tc to-run)
-                              (multiple-value-bind (content status)
-                                  (dispatch-tool-call agent tc policy)
-                                (on-tool-result agent
-                                                (agent-cl.messages:tool-call-name tc)
-                                                (list :content content :status status))
-                                (setf (agent-messages agent)
-                                      (append (agent-messages agent)
-                                              (list (agent-cl.messages:tool-result-message
-                                                     (agent-cl.messages:tool-call-id tc)
-                                                     content))))))))
+                                               :tool-calls to-run))))
+                          (incf tool-count (length to-run))
+                          (dolist (tc to-run)
+                            (multiple-value-bind (content status)
+                                (dispatch-tool-call agent tc policy)
+                              (on-tool-result agent
+                                              (agent-cl.messages:tool-call-name tc)
+                                              (list :content content :status status))
+                              (setf (agent-messages agent)
+                                    (append (agent-messages agent)
+                                            (list (agent-cl.messages:tool-result-message
+                                                   (agent-cl.messages:tool-call-id tc)
+                                                   content)))))))
                         (let ((content (or (agent-cl.llm:result-content result) "")))
                           (setf (agent-messages agent)
                                 (append (agent-messages agent)

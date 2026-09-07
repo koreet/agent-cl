@@ -64,9 +64,9 @@
   "Temporarily replace the global registry with only TOOL-NAMES registered."
   `(let ((agent-cl.tools:*tool-registry*
            (let ((h (make-hash-table :test 'equal)))
-             (dolist (n ',tool-names)
-               (let ((t (find-tool n)))
-                 (when t (setf (gethash n h) t))))
+             (dolist (tool-name ',tool-names)
+               (let ((tool (find-tool tool-name)))
+                 (when tool (setf (gethash tool-name h) tool))))
              h)))
      ,@body))
 
