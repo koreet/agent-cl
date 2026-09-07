@@ -35,7 +35,10 @@
 ;;; ---------------------------------------------------------------------------
 
 (defclass policy ()
-  ((max-steps        :initarg :max-steps :initform 20 :accessor policy-max-steps)
+  ;; max-steps defaults to NIL = unlimited (the agent runs until it answers,
+  ;; a guard fires, or the user stops it). Callers who want a hard cap pass an
+  ;; explicit :max-steps (defpolicy / defagent / delegate child budgets).
+  ((max-steps        :initarg :max-steps :initform nil :accessor policy-max-steps)
    (temperature      :initarg :temperature :initform nil :accessor policy-temperature)
    (max-tool-results :initarg :max-tool-results :initform 4000
                      :accessor policy-max-tool-results)
@@ -50,9 +53,9 @@
                          max-tokens)
   ;; NB: two-step defaults. Booleans default to T; a *supplied* NIL is honored
   ;; (callers pass :parallel-tools nil to disable), whereas an unsupplied
-  ;; keyword (also NIL) means "use the default T".
+  ;; keyword (also NIL) means "use the default T". max-steps nil = unlimited.
   (make-instance 'policy
-                 :max-steps (or max-steps 20)
+                 :max-steps max-steps
                  :temperature temperature
                  :max-tool-results (or max-tool-results 4000)
                  :parallel-tools (if parallel-tools-p parallel-tools t)
@@ -303,7 +306,8 @@
 
 (defun run (agent task &key (max-steps nil) (stream nil) (on-token nil))
   "Drive AGENT on TASK until the model answers, a guard fires, or the step
-  budget is exhausted. Returns a turn-summary; the conversation transcript
+  budget is exhausted (a NIL budget = no step limit; the agent runs until it
+  answers or is stopped). Returns a turn-summary; the conversation transcript
   remains in (agent-messages agent)."
   (setf (agent-stopped-p agent) nil)
   (setf (agent-messages agent)
@@ -315,7 +319,7 @@
          (guard-reason nil)
          (final nil)
          (tool-count 0))
-    (loop while (and (< step budget)
+    (loop while (and (or (null budget) (< step budget))
                      (null final)
                      (not (agent-stopped-p agent)))
           do (incf step)

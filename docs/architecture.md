@@ -254,10 +254,12 @@ idle ──start(task)──▶ thinking ──llm ok──▶ waiting_tool │ 
 ```
 
 **守卫（防失控）**——按序检查，命中即停并给出可读原因：
-1. `:max-steps`（默认 20）——LLM 往返 + 工具执行轮数；
+1. `:max-steps`（**默认无限制**；需显式传值启用，如 `defpolicy (:max-steps 30)`、delegate 子代理默认 6）——LLM 往返 + 工具执行轮数；
 2. `:max-duration` / `:deadline`（挂钟时间）；
 3. `:max-tokens` / `:budget-usd`（usage 记账，流式也要增量记）；
 4. `:danger-ratio`——高危工具（shell 等）连续失败次数上限。
+
+> 实现注记：2026-09-07 起 `max-steps` 默认改为 NIL（无上限），让 agent 不被默认 20 步打断，跑完即停；失控防护依赖显式步数/`max-tokens`/用户 Ctrl-C 停止。2/4（挂钟、danger-ratio）尚未实现；`max-tokens`（usage 上限）在 `guard-violation-p` 中生效。
 
 命中守卫抛出 `guard-triggered` 条件，携带已完成对话；上层可选择把该条件作为一条 tool 错误消息喂回模型让其收敛（可配置）。
 
