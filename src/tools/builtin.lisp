@@ -203,7 +203,7 @@
                                                         :timeout timeout)
                      (error (e)
                        (return-from code-exec
-                         (values (format nil "cannot run ~a: ~a" language e)
+                         (values (format nil "cannot run ~a: ~a" (or language "python") e)
                                  :error))))
                  (let* ((clean-err (string-trim '(#\Space #\Tab #\Newline #\Return)
                                                 (or err "")))

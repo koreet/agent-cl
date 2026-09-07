@@ -105,6 +105,34 @@
 ;; Returns (values out err exit) where EXIT is :timeout on kill.
 ;; ---------------------------------------------------------------------------
 
+(defun read-file-bytes (path)
+  "Read a whole file as an (unsigned-byte 8) vector."
+  (with-open-file (in path :element-type '(unsigned-byte 8)
+                         :direction :input)
+    (let ((buf (make-array (file-length in)
+                           :element-type '(unsigned-byte 8))))
+      (read-sequence buf in)
+      buf)))
+
+(defun read-file-lenient (path)
+  "Read a file as text without ever throwing on byte encoding. Subprocess
+  output on Windows may be written in the ANSI codepage (GBK) rather than
+  UTF-8, and a strict UTF-8 read then raises a stream decoding error that
+  surfaces as a baffling tool failure. Strategy: try UTF-8, then GBK/cp936,
+  finally a lossy byte->char fallback so callers always get a string."
+  (when (uiop:file-exists-p path)
+    (let ((bytes (read-file-bytes path)))
+      (flet ((octets (ext)
+               (ignore-errors
+                (sb-ext:octets-to-string bytes :external-format ext))))
+        (or (octets :utf-8)
+            (octets :cp936)
+            (octets :gbk)
+            ;; last resort: never fail, keep ASCII readable
+            (map 'string (lambda (b)
+                           (if (< b 128) (code-char b) #\?))
+                 bytes))))))
+
 (defun run-program-with-timeout (argv &key (timeout 60) (directory nil))
   "Run ARGV with a hard wall-clock TIMEOUT. uiop:run-program :timeout is
   unreliable on Windows (verified: a 3s timeout on `ping -n 30` returned after
@@ -151,20 +179,16 @@
                                  (list "kill" "-9" (princ-to-string pid)))
                              :output nil :error-output nil
                              :ignore-error-status t))))
-                       (values (if (uiop:file-exists-p out-file)
-                                     (uiop:read-file-string out-file) "")
-                               (if (uiop:file-exists-p err-file)
-                                     (uiop:read-file-string err-file) "")
+                       (values (read-file-lenient out-file)
+                               (read-file-lenient err-file)
                                :timeout))
                      ;; finished before the deadline: wait for its exit code
                      (let ((exit
                              (handler-case
                                  (uiop:wait-process proc)
                                (error () nil))))
-                       (values (if (uiop:file-exists-p out-file)
-                                     (uiop:read-file-string out-file) "")
-                               (if (uiop:file-exists-p err-file)
-                                     (uiop:read-file-string err-file) "")
+                       (values (read-file-lenient out-file)
+                               (read-file-lenient err-file)
                                (if (integerp exit) exit :unknown)))))
             ;; cleanup: make sure the child never survives us, remove temp files
             (when (ignore-errors (uiop:process-alive-p proc))

@@ -39,6 +39,7 @@
    #:read-file-string
    #:write-file-string
    #:shell-command
+   #:read-file-lenient
    #:run-program-with-timeout))
 
 (defpackage #:agent-cl.messages

@@ -407,6 +407,28 @@
     (is-equal :error status)
     (ok (search "exit" content))))
 
+(deftest read-file-lenient-tolerates-gbk-bytes
+  ;; Subprocess output on Windows may be GBK, not UTF-8; the watchdog must
+  ;; never raise a stream decoding error on such files (regression for the
+  ;; ":UTF-8 stream decoding error / octet sequence #(211 201)" failures).
+  (let* ((f (merge-pathnames ".tools/tmp-gbk-test.txt" (uiop:getcwd)))
+         (gbk (make-array 4 :element-type '(unsigned-byte 8)
+                            :initial-contents
+                            ;; "中文" in GBK/cp936 = D6 D0 CE C4
+                            (list #xD6 #xD0 #xCE #xC4))))
+    (ensure-directories-exist f)
+    (unwind-protect
+         (progn
+           (with-open-file (o f :direction :output
+                                 :element-type '(unsigned-byte 8)
+                                 :if-exists :supersede)
+             (write-sequence gbk o))
+           ;; must return a string, never throw
+           (let ((text (agent-cl.core:read-file-lenient f)))
+             (ok (stringp text))
+             (ok (plusp (length text)))))
+      (ignore-errors (delete-file f)))))
+
 (deftest code-exec-engine-roundtrip-mock
   ;; model asks for code, engine dispatches code.exec, result fed back to model
   (agent-cl.tools:register-builtin-tools)
