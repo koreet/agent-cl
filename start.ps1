@@ -1,4 +1,4 @@
-<#
+﻿<#
   start.ps1 — Agent-CL 一键启动器
 
   用法：

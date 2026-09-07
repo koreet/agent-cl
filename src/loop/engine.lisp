@@ -44,16 +44,19 @@
                       :accessor policy-allow-model-retry)
    (max-tokens       :initarg :max-tokens :initform nil :accessor policy-max-tokens)))
 
-(defun make-policy (&key max-steps temperature max-tool-results parallel-tools
-                         allow-model-retry max-tokens)
-  ;; NB: the &key defaults are NIL — never pass NIL straight into initargs or
-  ;; the class initforms (20 / 4000 / T / T) get overridden.
+(defun make-policy (&key max-steps temperature max-tool-results
+                         (parallel-tools nil parallel-tools-p)
+                         (allow-model-retry nil allow-model-retry-p)
+                         max-tokens)
+  ;; NB: two-step defaults. Booleans default to T; a *supplied* NIL is honored
+  ;; (callers pass :parallel-tools nil to disable), whereas an unsupplied
+  ;; keyword (also NIL) means "use the default T".
   (make-instance 'policy
                  :max-steps (or max-steps 20)
                  :temperature temperature
                  :max-tool-results (or max-tool-results 4000)
-                 :parallel-tools (if (null parallel-tools) t parallel-tools)
-                 :allow-model-retry (if (null allow-model-retry) t allow-model-retry)
+                 :parallel-tools (if parallel-tools-p parallel-tools t)
+                 :allow-model-retry (if allow-model-retry-p allow-model-retry t)
                  :max-tokens max-tokens))
 
 ;;; ---------------------------------------------------------------------------
@@ -140,8 +143,12 @@
 
 (defmethod choose-messages ((a agent))
   "Default context policy (M5): system + transcript, bounded by MAX-HISTORY
-  (last N turns) and CONTEXT-BUDGET (approx tokens). Long conversations are
-  windowed automatically; subclass/override for compaction strategies."
+  (last N turns) and CONTEXT-BUDGET (approx tokens). Trimming is done on whole
+  *turns* (a user message plus everything up to the next user message) so an
+  assistant tool-call and its tool results are never split apart — splitting
+  them would send the provider an illegal message sequence (400). Long
+  conversations are windowed automatically; subclass/override for compaction
+  strategies."
   (let* ((sys-text (agent-system a))
          (transcript (copy-list (agent-messages a)))
          (msgs (if sys-text
@@ -149,15 +156,45 @@
                    transcript)))
     (let ((max-hist (agent-max-history a)))
       (when (and max-hist (> (length transcript) max-hist))
-        ;; keep system + the most recent max-hist messages
-        (setf msgs (append (when sys-text (list (first msgs)))
-                           (last transcript max-hist)))))
+        ;; Keep newest whole turns while their total stays <= MAX-HIST. If even
+        ;; the newest turn alone exceeds MAX-HIST, keep that turn intact anyway
+        ;; (a split tool-call pair is worse than exceeding the soft cap).
+        (let ((turns (split-turns transcript))
+              (kept nil) (total 0))
+          (dolist (turn (reverse turns))
+            (when (or (null kept)
+                      (<= (+ total (length turn)) max-hist))
+              (push turn kept)
+              (incf total (length turn))))
+          (setf transcript (apply #'append kept))
+          (setf msgs (append (when sys-text (list (first msgs)))
+                             transcript)))))
     (let ((budget (agent-context-budget a)))
-      (when (and budget (> (msgs-tokens msgs) budget) (> (length msgs) 2))
-        ;; drop oldest non-system messages until within budget
-        (loop while (and (> (msgs-tokens msgs) budget) (> (length msgs) 2))
-              do (setf msgs (cons (first msgs) (cddr msgs))))))
+      (when (and budget (> (msgs-tokens msgs) budget))
+        ;; Drop oldest whole turns until within budget. Always keep system plus
+        ;; at least one complete turn — never trim down to nothing, and never
+        ;; split a tool-call/tool-result pair.
+        (let ((turns (split-turns (cdr msgs))))
+          (loop while (and (> (length turns) 1)
+                           (> (msgs-tokens
+                               (cons (first msgs) (apply #'append turns)))
+                              budget))
+                do (pop turns))
+          (setf msgs (cons (first msgs) (apply #'append turns))))))
     msgs))
+
+(defun split-turns (transcript)
+  "Split a transcript (without system message) into whole turns. A turn starts
+  at a :user message and runs until the next :user message (exclusive). Leading
+  non-user messages (rare) form their own opening turn."
+  (let ((turns nil) (cur nil))
+    (dolist (m transcript)
+      (cond ((and cur (eq (agent-cl.messages:msg-role m) :user))
+             (push (nreverse cur) turns)
+             (setf cur (list m)))
+            (t (push m cur))))
+    (when cur (push (nreverse cur) turns))
+    (nreverse turns)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; internals
