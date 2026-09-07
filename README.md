@@ -10,9 +10,8 @@
 
 - **ReAct 引擎 + 工具调用**：内置 shell/file/time/code.exec(写代码执行)/memory.set|recall(跨会话记忆)/web.search(免 key DuckDuckGo)/task.delegate(子 agent 独立会话，只回结论省 token)
 - **Plan-then-Execute**：REPL `/plan <任务>`：拆步骤→逐步执行→汇总（步骤在一次性子会话执行，不污染主历史）
-- **长会话自动压缩**：超预算自动把旧消息凝成摘要（`/compact` 手动、`/budget` 调阈值）
 - **流式输出 + Markdown 渲染**：SSE 逐字输出；标题/粗体/行内码/代码块（关键字着色）/表格行着色（`NO_COLOR=1` 或 `/color off` 关闭）
-- **REPL 命令面板**：`/help /tools /memory /export <f> /load <f> /new /compact /budget /plan /color /quit`
+- **REPL 命令面板**：`/help /tools /memory /export <f> /load <f> /new /plan /color /quit`
 - **会话导出/载入**：JSONL 往返（载入自动净化被截断的会话），可复盘/换机续聊
 - 工具执行可视化（`[tool xxx -> OK]`）、Ctrl-C 优雅退出
 - **可靠性**：瞬态 5xx/429 自动指数退避重试（`*max-retries*`，可经 policy 关闭）；shell/code.exec 有真实超时看门狗（Windows 下 uiop 超时失效的替代，超时杀进程树）；file.read/write 默认限制在仓库根工作区内（`set-file-workspace-root nil` 放开）
@@ -28,7 +27,7 @@
 | M2 | ReAct 引擎：schema 校验器、工具注册表、内置工具（shell/file/time/code.exec/memory/web.search/task.delegate）、守卫、CLOS 扩展钩子 | ✅ |
 | M3 | DSL 层：`defdsl-tool`/`defcommand`/`defschema`/`defpolicy`/`defguard`/`defagent` + 默认禁用的白名单沙箱 | ✅ |
 | M4 | 会话事件日志（JSONL）+ 导出/载入 + 暂停/恢复 + REPL 入口 | ✅ |
-| M5 | 记忆预算/自动压缩（`/compact`/`/budget`）+ Plan-then-Execute（`/plan`） | ✅ |
+| M5 | 引擎窗口/预算裁剪（max-history/context-budget，超限丢旧回合，默认可开可关）+ Plan-then-Execute（`/plan`） | ✅ |
 | M6 | 真实 API 冒烟 + Windows 11 真机全量回归 | ✅ DeepSeek 端到端通过——SBCL 进程内 dexador+cl+ssl 直连（`scripts/smoke.lisp` 优先 dexador，缺依赖回退 node 钩子）；回归实录见 `docs/architecture.md` §14 |
 
 **测试**：`66/66` 通过（`scripts/run-tests.lisp` 或 `.\start.ps1 -Mode test`，全部 mock 确定性测试）+ 真实 DeepSeek 冒烟 `[SMOKE-OK]`（Windows 11 真机全量回归记录见 `docs/architecture.md` §14）。

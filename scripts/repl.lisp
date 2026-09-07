@@ -302,79 +302,7 @@
   (format t "  /new           清空当前会话~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
-  (format t "  /compact       手动压缩旧会话为摘要~%")
-  (format t "  /budget <tokens> 设置自动压缩触发预算（默认 6000）~%")
   (format t "  /quit 或 /exit 退出~%"))
-
-(defvar *context-budget-chars* 6000
-  "自动压缩触发预算（按 approx tokens；/budget 可改）")
-
-(defun ctx-tokens (agent)
-  "Approx tokens of the whole transcript. Content + (for assistant messages)
-  every tool call's name and JSON arguments, so big tool-call payloads are not
-  underestimated when deciding whether to compact."
-  (loop for m in (agent-cl.loop:agent-messages agent)
-        sum (+ (agent-cl.core:approx-tokens
-                (or (agent-cl.messages:msg-content m) ""))
-               (loop for tc in (agent-cl.messages:msg-tool-calls m)
-                     sum (+ (agent-cl.core:approx-tokens
-                             (agent-cl.messages:tool-call-name tc))
-                            (agent-cl.core:approx-tokens
-                             (agent-cl.messages:tool-call-arguments tc)))))))
-
-(defun msg-line (m)
-  (format nil "[~a] ~a" (agent-cl.messages:msg-role m)
-          (or (agent-cl.messages:msg-content m) "")))
-
-(defun summarize-in-child (agent text)
-  "用一次独立短会话把旧对话压缩成摘要；失败返回 NIL。"
-  (handler-case
-      (let* ((child (agent-cl.loop:make-agent
-                     :transport (agent-cl.loop:agent-transport agent)
-                     :model (agent-cl.loop:agent-model agent)
-                     :tools nil
-                     :system "你是会话压缩器。把用户提供的早前对话浓缩为中文要点（250 字内），保留关键事实、结论与工具结果数值。只输出摘要。"
-                     :policy (agent-cl.loop:make-policy :max-steps 1)))
-             (r (agent-cl.loop:ask child text))
-             (f (agent-cl.loop:final-content r)))
-        (if (and (agent-cl.loop:done-p r) f) f nil))
-    (error () nil)))
-
-(defun maybe-compact (agent)
-  "上下文超预算时，把最旧消息交给模型凝成摘要后替换（保留较新部分）。"
-  (when (> (ctx-tokens agent) *context-budget-chars*)
-    (let* ((msgs (agent-cl.loop:agent-messages agent))
-           (n (length msgs))
-           (target (* *context-budget-chars* 0.5)))
-      (when (> n 2)
-        (let (kept-rev (acc 0))
-          ;; 从最新往回收，直到近似 token 达到目标（至少保留 1 条）
-          (dolist (m (reverse msgs))
-            (push m kept-rev)
-            (incf acc (agent-cl.core:approx-tokens
-                       (or (agent-cl.messages:msg-content m) "")))
-            (when (>= acc target) (return)))
-          (let* ((kept (nreverse kept-rev))
-                 (drop-n (- n (length kept))))
-            ;; 切割边界净化：若 kept 以孤立的 tool 结果开头（其 assistant
-            ;; tool-call 已被压进摘要），把这类 tool 也并入被压缩区，避免
-            ;; 下次请求以 :tool 消息开头 -> provider 400。
-            (loop while (and (plusp (length kept))
-                             (eq (agent-cl.messages:msg-role (first kept)) :tool))
-                  do (pop kept)
-                     (incf drop-n))
-            (when (and (plusp drop-n) kept)
-              (let* ((drop (subseq msgs 0 drop-n))
-                     (summary (summarize-in-child
-                               agent (format nil "~{~a~%~}" (mapcar #'msg-line drop)))))
-                (unless summary
-                  (setf summary (format nil "（早前 ~a 条消息已压缩）" drop-n)))
-                (setf (agent-cl.loop:agent-messages agent)
-                      (cons (agent-cl.messages:user-message
-                             (format nil "[早前会话摘要] ~a" summary))
-                            kept))
-                (format t "~&[compact] 已压缩 ~a 条旧消息 -> 摘要（预算 ~a）~%"
-                        drop-n *context-budget-chars*)))))))))
 
 (defun repl-command (line agent)
   (let* ((trim (string-trim '(#\Space #\Tab) line))
@@ -398,9 +326,6 @@
       ((string= cmd "/new")
        (setf (agent-cl.loop:agent-messages agent) nil)
        (format t "~&已清空当前会话~%"))
-      ((string= cmd "/compact")
-       (maybe-compact agent)
-       (format t "~&当前 ~a tokens~%" (ctx-tokens agent)))
       ((string= cmd "/plan")
        (let ((f (and rest (find-symbol "RUN-PLANNED" "AGENT-CL.PLAN"))))
          (if f
@@ -411,11 +336,6 @@
                (error (e)
                  (format t "~&[plan] 失败: ~a~%" e)))
              (format t "~&/plan 不可用：scripts/plan.lisp 未加载~%"))))
-      ((string= cmd "/budget")
-       (let ((v (and rest (ignore-errors (parse-integer rest)))))
-         (if v (progn (setf *context-budget-chars* v)
-                      (format t "~&预算设为 ~a tokens~%" v))
-             (format t "~&用法: /budget <tokens>~%"))))
       ((string= cmd "/color")
        (setf *color* (not (and rest (string= rest "off"))))
        (format t "~&颜色: ~a~%" (if *color* "on" "off")))
@@ -425,7 +345,6 @@
 
 
 (defun ask-turn (agent line)
-  (maybe-compact agent)
   (reset-tokens)
   (handler-case
       (let ((summary (agent-cl.loop:ask agent line :stream t

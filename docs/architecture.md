@@ -599,7 +599,7 @@ data: [DONE]
 ### 13.3 已知边界
 
 - Windows 沙箱无 schannel 凭据、无管理员、winget 别名不可用 → 离线工具链（详见 README）；
-- `defguard`/记忆压缩等"运行期策略"走 CLOS 钩子，改行为=子类/覆写方法，不触碰引擎；
+- `defguard` 等"运行期策略"走 CLOS 钩子，改行为=子类/覆写方法，不触碰引擎；
 - 真实模型行为（工具选择质量、schema 生成）只能由 M6 冒烟验证，本仓库测试负责的是协议与确定性语义。
 
 ---
@@ -671,7 +671,7 @@ data: [DONE]
 
 ### 15.2 消息裁剪与校验（易致 400 的静默缺陷）
 
-- `choose-messages` 与 REPL `maybe-compact` 此前按单消息/纯 token 切窗，会**拆散 assistant(tool_calls) 与其 tool 结果对**或以孤立 `:tool` 消息开头 → provider 拒绝。现按完整用户回合（turn chunk）裁剪，预算裁剪至少保留 1 个完整回合（宁超不拆）。
+- 引擎 `choose-messages` 此前按单消息/纯 token 切窗，会**拆散 assistant(tool_calls) 与其 tool 结果对**或以孤立 `:tool` 消息开头 → provider 拒绝。现按完整用户回合（turn chunk）裁剪，预算裁剪至少保留 1 个完整回合（宁超不拆）。（REPL `maybe-compact` 的同类边界净化同批完成，该 REPL 摘要压缩已于 2026-09-07 整体移除，见 §15.5。）
 - `json-schema` `prop-key`/`find-prop` 未按 core/json 的 snake→kebab 规则规范化键名：带下划线属性（`max_steps`、`max_results`…）必填恒误报、类型校验被静默跳过。统一为 `norm-property-key`。
 - `validate-value`/`validate-object` 的嵌套校验结果被**丢弃**（push 只作用于形参、返回值未接）→ 属性类型校验从未真正生效。`setf` 接收返回值后修复。
 - `:integer` 校验现在容忍整数值浮点（模型常发 `3.0`）。
@@ -686,12 +686,26 @@ data: [DONE]
 
 ### 15.4 REPL / 启动器 / 其它
 
-- `render-inline` 未闭合 `**` 行尾强制复位（防终端残留加粗）；`ctx-tokens` 补计 assistant tool_calls 的 name+arguments。
+- `render-inline` 未闭合 `**` 行尾强制复位（防终端残留加粗）。
 - `import-transcript` 净化被截断导出的会话（去前导孤立 tool 与尾部悬空 tool_calls），续谈不再 400。
 - `start.ps1` 恢复 UTF-8 BOM（PS 5.1 中文解析）并 `Set-Location` 到仓库根；`start.bat` 转 ASCII+CRLF（cmd 下 UTF-8 注释报错）。
 - dev-http 429 视为可重试；HTML 实体解码扩展（quot/apos/nbsp/数字实体）；yason 解码语义实测并修正注释（null→NIL）。
 
 测试计数：55 → **66**（新增 sandbox 逃逸、下划线属性校验、数组 items 类型、整数浮点容忍、重试三态、看门狗超时、code.exec 超时、workspace 约束、memory 键不碰撞等）。
+
+### 15.5 REPL 摘要式上下文压缩已移除（2026-09-07）
+
+决策：REPL 的"调模型把旧会话凝成摘要"方案不好用，整体移除，后续不再采用该思路。
+
+删除范围（`scripts/repl.lisp`）：
+- 自动触发：`maybe-compact`、`*context-budget-chars*`、`ctx-tokens`、`summarize-in-child`、`msg-line`（含 `ask-turn` 前的自动压缩调用）；
+- 手动命令：`/compact`、`/budget`（连同 `/help` 中的说明行）。
+
+保留：
+- 引擎层上下文管理 `max-history` / `context-budget`（超限丢弃最旧完整回合，不调模型、不生成摘要；默认关闭、按 agent 配置启用）——已在 §15.2 做过配对安全的 turn 级裁剪；
+- `task.delegate` 的子会话"只回结论"、`/plan` 的一次性子会话步骤执行不受影响（那属于任务委派而非上下文压缩）。
+
+超长会话的后续方向：由用户主动 `/new` 或引擎窗口裁剪处理，不再自动调模型做摘要。
 
 ---
 
