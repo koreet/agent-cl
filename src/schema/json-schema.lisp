@@ -160,7 +160,11 @@
        (unless (or (null value) (numberp value))
          (push (format nil "~a: expected number, got ~s" path value) problems)))
       ((eq type :integer)
-       (unless (or (null value) (and (numberp value) (integerp value)))
+       (unless (or (null value)
+                   (and (numberp value)
+                        (integerp value))
+                   ;; tolerate integral floats ("3.0") some models emit
+                   (and (numberp value) (= value (floor value))))
          (push (format nil "~a: expected integer, got ~s" path value) problems)))
       ((eq type :boolean)
        (unless (member value '(t nil))

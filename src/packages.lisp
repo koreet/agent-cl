@@ -38,7 +38,8 @@
    #:alist->plist
    #:read-file-string
    #:write-file-string
-   #:shell-command))
+   #:shell-command
+   #:run-program-with-timeout))
 
 (defpackage #:agent-cl.messages
   (:use #:cl)
@@ -64,6 +65,7 @@
    #:make-http-transport #:make-mock-transport
    #:perform-request
    #:mock-script #:mock-push #:mock-reset #:script-reply #:script-stream
+   #:script-error
    ;; --- chat result ---
    #:turn-result
    #:result-content #:result-tool-calls #:result-finish-reason #:result-usage
@@ -100,6 +102,8 @@
    #:register-tool #:unregister-tool #:find-tool #:list-tools #:call-tool
    #:*tool-registry*
    #:with-tools
+   ;; file workspace confinement
+   #:*file-workspace-root* #:set-file-workspace-root #:workspace-check
    ;; builtin tools
    #:register-builtin-tools
    #:shell-tool #:file-tool #:time-tool))

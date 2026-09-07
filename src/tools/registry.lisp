@@ -42,8 +42,23 @@
   "Global tool registry: name string -> tool.")
 
 (defun register-tool (tool &optional (registry *tool-registry*))
-  (setf (gethash (tool-name tool) registry) tool)
-  tool)
+  "Register TOOL. Warns (and skips) when another registered tool shares the
+  same sanitized wire name — e.g. 'a.b' and 'a_b' both become a_b on the wire,
+  and reverse lookup (find-tool) would otherwise resolve nondeterministically."
+  (let ((name (tool-name tool))
+        (wire (tool-wire-name tool)))
+    (when (and (gethash name registry) (not (eq (gethash name registry) tool)))
+      (format t "~&[tools] 覆盖注册 ~a~%" name))
+    (let ((clash
+            (loop for t1 being the hash-values of registry
+                  when (and (not (string= (tool-name t1) name))
+                            (string= (tool-wire-name t1) wire))
+                    return (tool-name t1))))
+      (when clash
+        (format t "~&[tools] 警告：~a 与 ~a 的线上名称同为 ~a；find-tool 反向查找可能取错~%"
+                name clash wire)))
+    (setf (gethash name registry) tool)
+    tool))
 
 (defun unregister-tool (name &optional (registry *tool-registry*))
   (remhash name registry))

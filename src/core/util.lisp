@@ -89,9 +89,85 @@
         (uiop:run-program command
                           :output :string :error-output :string
                           :directory (namestring dir)
-                          ;; NB: on Windows there is no real per-process timeout
-                          ;; in uiop; uiop kills after :timeout on most platforms.
                           :timeout timeout
                           :ignore-error-status t)
       (declare (ignore err))
       (values (or out "") exit))))
+
+;; ---------------------------------------------------------------------------
+;; run-program-with-timeout — hard wall-clock watchdog
+;;
+;; uiop:run-program :timeout is unreliable on Windows (verified: a 3s timeout
+;; on `ping -n 30` returned after 34s). Tools like shell.run / code.exec pass a
+;; model-supplied TIMEOUT and would otherwise hang the engine forever. This
+;; helper runs the child asynchronously, polls it, and kills the whole process
+;; tree (taskkill /F /T on Windows, SIGKILL elsewhere) once the deadline hits.
+;; Returns (values out err exit) where EXIT is :timeout on kill.
+;; ---------------------------------------------------------------------------
+
+(defun run-program-with-timeout (argv &key (timeout 60) (directory nil))
+  "Run ARGV with a hard wall-clock TIMEOUT. uiop:run-program :timeout is
+  unreliable on Windows (verified: a 3s timeout on `ping -n 30` returned after
+  34s), so this launches the child asynchronously, polls it, and kills the
+  whole process tree (taskkill /F /T on Windows, SIGKILL elsewhere) once the
+  deadline hits. Returns (values out err exit); EXIT is :timeout on kill."
+  (let ((dir (or directory (uiop:getcwd))))
+    (if (null timeout)
+        ;; no deadline: plain synchronous run
+        (uiop:run-program argv :output :string :error-output :string
+                          :directory (namestring dir)
+                          :ignore-error-status t)
+        (let* ((stamp (format nil "~d-~d" (get-universal-time)
+                              (random 100000)))
+               (tmp-dir (uiop:ensure-directory-pathname
+                         (merge-pathnames ".tools/tmp/" (uiop:getcwd))))
+               (out-file (merge-pathnames
+                          (format nil "watchdog-~a-out.txt" stamp) tmp-dir))
+               (err-file (merge-pathnames
+                          (format nil "watchdog-~a-err.txt" stamp) tmp-dir))
+               (deadline (+ (get-internal-real-time)
+                            (round (* timeout internal-time-units-per-second))))
+               (proc (uiop:launch-program
+                      argv
+                      :output (namestring out-file)
+                      :error-output (namestring err-file)
+                      :directory (namestring dir))))
+          (ensure-directories-exist out-file)
+          (unwind-protect
+               (progn
+                 (loop while (and (<= (get-internal-real-time) deadline)
+                                  (ignore-errors (uiop:process-alive-p proc)))
+                       do (sleep 0.05))
+                 (if (ignore-errors (uiop:process-alive-p proc))
+                     ;; still alive after the deadline -> kill the process tree
+                     (progn
+                       (let ((pid (ignore-errors (uiop:process-info-pid proc))))
+                         (when pid
+                           (ignore-errors
+                            (uiop:run-program
+                             (if (uiop:os-windows-p)
+                                 (list "taskkill" "/pid" (princ-to-string pid)
+                                       "/T" "/F")
+                                 (list "kill" "-9" (princ-to-string pid)))
+                             :output nil :error-output nil
+                             :ignore-error-status t))))
+                       (values (if (uiop:file-exists-p out-file)
+                                     (uiop:read-file-string out-file) "")
+                               (if (uiop:file-exists-p err-file)
+                                     (uiop:read-file-string err-file) "")
+                               :timeout))
+                     ;; finished before the deadline: wait for its exit code
+                     (let ((exit
+                             (handler-case
+                                 (uiop:wait-process proc)
+                               (error () nil))))
+                       (values (if (uiop:file-exists-p out-file)
+                                     (uiop:read-file-string out-file) "")
+                               (if (uiop:file-exists-p err-file)
+                                     (uiop:read-file-string err-file) "")
+                               (if (integerp exit) exit :unknown)))))
+            ;; cleanup: make sure the child never survives us, remove temp files
+            (when (ignore-errors (uiop:process-alive-p proc))
+              (ignore-errors (uiop:terminate-process proc)))
+            (ignore-errors (delete-file out-file))
+            (ignore-errors (delete-file err-file)))))))

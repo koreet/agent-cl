@@ -1,6 +1,6 @@
 # Agent-CL 架构设计文档
 
-- 状态：v0.3（评审 #1 决策已固化见 §0.1；M0–M5 已按本文实现并测试，增补见 §13；全真机回归记录见 §14）
+- 状态：v0.4（评审 #1 决策已固化见 §0.1；M0–M6 已按本文实现并测试，增补见 §13；全真机回归记录见 §14；二次深度审查与可靠性强化见 §15）
 - 语言：Common Lisp（实现：SBCL，Windows 11 / 可移植到 Unix）
 - 日期：2025
 - 本文回答三个问题：**做什么**（能力边界）、**怎么做**（模块与协议）、**怎么扩展**（DSL 深度定制机制）
@@ -584,7 +584,7 @@ data: [DONE]
 | M5 | 记忆预算 | ✅ 窗口（max-history）+ Token 预算（context-budget）+ `before-llm-call`/`choose-messages` 钩子接线 |
 | M6 | 真 API 冒烟/双平台 | ✅ DeepSeek 端到端冒烟（沙箱内经 node/OpenSSL 传输钩子 `scripts/http-request.js` + `scripts/smoke.lisp`）；双平台待办 |
 
-测试：`.\start.ps1 -Mode test`（等价 `scripts/run-tests.lisp`）跑 55 个用例全部通过（全部 mock 确定性，零真实 API 消耗）；真机回归实录见 §14。
+测试：`.\start.ps1 -Mode test`（等价 `scripts/run-tests.lisp`）跑 66 个用例全部通过（全部 mock 确定性，零真实 API 消耗）；真机回归实录见 §14；二次深度代码审查与修复记录见 §15。
 
 ### 13.2 与原文档的取舍（均为离线沙箱驱动的工程适配，均有注释标记）
 
@@ -654,4 +654,45 @@ data: [DONE]
 - `.sbclrc` 含 Quicklisp 引导行（安装脚本写入）。
 
 ---
+
+## 15. 二次代码审查与可靠性强化（2026-09-07）
+
+三路并行只读审查（引擎/LLM 传输层、scripts/ 运行时、工具+会话+DSL 层）后修复，全部 66 mock 用例 + 真实 smoke 通过。
+
+### 15.1 引擎与传输层
+
+| 严重度 | 修复 |
+|---|---|
+| 高 | `run` 串行工具模式此前把**全部** tool_calls 写入 assistant 消息却只执行第一个 → 悬挂 tool_call id，下轮请求非法（400）。改为只记录实际执行者（`let*` 修正了原 `let` 平行绑定的 unbound bug） |
+| 高 | `dispatch-tool-call` 对畸形 arguments JSON（截断流/模型幻觉）直接崩溃整个 run → 捕获并作为工具错误反馈，transcript 保持一致 |
+| 中 | 流式 EOF 未收到 `[DONE]` 且无 finish_reason 被当成功 → 静默截断；现在抛 `transport-error`（可重试） |
+| 中 | 非流式 2xx 空 choices 被当空答案成功 → 显式报错 |
+| 中 | **重试机制落地**：`call-model` 对 5xx/429（`transport-error-retryable-p`）指数退避重试，次数受 `agent-cl.llm:*max-retries*` 且受 policy `allow-model-retry` 门控；mock transport 新增 `script-error` 场景（3 个新测试覆盖重试成功/耗尽/关闭） |
+
+### 15.2 消息裁剪与校验（易致 400 的静默缺陷）
+
+- `choose-messages` 与 REPL `maybe-compact` 此前按单消息/纯 token 切窗，会**拆散 assistant(tool_calls) 与其 tool 结果对**或以孤立 `:tool` 消息开头 → provider 拒绝。现按完整用户回合（turn chunk）裁剪，预算裁剪至少保留 1 个完整回合（宁超不拆）。
+- `json-schema` `prop-key`/`find-prop` 未按 core/json 的 snake→kebab 规则规范化键名：带下划线属性（`max_steps`、`max_results`…）必填恒误报、类型校验被静默跳过。统一为 `norm-property-key`。
+- `validate-value`/`validate-object` 的嵌套校验结果被**丢弃**（push 只作用于形参、返回值未接）→ 属性类型校验从未真正生效。`setf` 接收返回值后修复。
+- `:integer` 校验现在容忍整数值浮点（模型常发 `3.0`）。
+- `defschema` `:array` 的 items 声明把元素名混进 spec → 元素类型静默变 `:string`；`(cdr (decl->prop …))` 修复。
+
+### 15.3 沙箱与工具安全
+
+- DSL 沙箱 `allowed-symbol-p` 曾有"任意 fbound CL 函数"兜底放行（sleep/read-line/print/symbol-value/directory 均可达），与白名单承诺矛盾 → 白名单成为唯一闸门；新增逃逸面回归测试。
+- **进程超时看门狗**：实测 Windows 上 `uiop:run-program :timeout 3` 对 30s 命令要跑 34s 才返回（超时失效）→ 新增 `run-program-with-timeout`：异步启动、轮询、超时杀进程树（taskkill /F /T；Unix SIGKILL），`shell.run`/`code.exec` 接入（2 个超时测试）。
+- **file 工作区约束**：`file.read`/`file.write` 默认限制在仓库根（`*file-workspace-root*`，`set-file-workspace-root` 可改/设 nil 放开）；`file.write` 标记 dangerous。注册同 wire 名（如 `a.b`/`a_b`）冲突时告警。
+- memory.set 键名改为**可逆编码**存储文件名（`a-b`/`a b`/`a/b` 此前全塌缩为 `a_b.json` 互相覆盖）+ 临时文件改名原子写。
+
+### 15.4 REPL / 启动器 / 其它
+
+- `render-inline` 未闭合 `**` 行尾强制复位（防终端残留加粗）；`ctx-tokens` 补计 assistant tool_calls 的 name+arguments。
+- `import-transcript` 净化被截断导出的会话（去前导孤立 tool 与尾部悬空 tool_calls），续谈不再 400。
+- `start.ps1` 恢复 UTF-8 BOM（PS 5.1 中文解析）并 `Set-Location` 到仓库根；`start.bat` 转 ASCII+CRLF（cmd 下 UTF-8 注释报错）。
+- dev-http 429 视为可重试；HTML 实体解码扩展（quot/apos/nbsp/数字实体）；yason 解码语义实测并修正注释（null→NIL）。
+
+测试计数：55 → **66**（新增 sandbox 逃逸、下划线属性校验、数组 items 类型、整数浮点容忍、重试三态、看门狗超时、code.exec 超时、workspace 约束、memory 键不碰撞等）。
+
+---
+
 

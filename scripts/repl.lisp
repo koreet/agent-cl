@@ -310,8 +310,17 @@
   "自动压缩触发预算（按 approx tokens；/budget 可改）")
 
 (defun ctx-tokens (agent)
+  "Approx tokens of the whole transcript. Content + (for assistant messages)
+  every tool call's name and JSON arguments, so big tool-call payloads are not
+  underestimated when deciding whether to compact."
   (loop for m in (agent-cl.loop:agent-messages agent)
-        sum (agent-cl.core:approx-tokens (or (agent-cl.messages:msg-content m) ""))))
+        sum (+ (agent-cl.core:approx-tokens
+                (or (agent-cl.messages:msg-content m) ""))
+               (loop for tc in (agent-cl.messages:msg-tool-calls m)
+                     sum (+ (agent-cl.core:approx-tokens
+                             (agent-cl.messages:tool-call-name tc))
+                            (agent-cl.core:approx-tokens
+                             (agent-cl.messages:tool-call-arguments tc)))))))
 
 (defun msg-line (m)
   (format nil "[~a] ~a" (agent-cl.messages:msg-role m)

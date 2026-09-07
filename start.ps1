@@ -4,7 +4,7 @@
   用法：
     .\start.ps1                 # 默认启动交互式 REPL（真实模型）
     .\start.ps1 -Mode smoke     # 跑一轮真实 API 冒烟（需 key）
-    .\start.ps1 -Mode test      # 跑全部 55 个单元/集成测试（不需 key）
+    .\start.ps1 -Mode test      # 跑全部 66 个单元/集成测试（不需 key）
     .\start.ps1 -Key sk-xxxx    # 临时指定 key（等价于设 AGENT_CL_API_KEY）
     .\start.bat                 # 同 start.ps1（可双击）
 

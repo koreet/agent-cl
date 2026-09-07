@@ -377,18 +377,42 @@
                                                   :max-steps))
                            :steps step :tool-count tool-count))))
 (defun call-model (agent params stream on-token)
-  "One LLM round trip. Returns (:ok turn-result) or (:error readable-reason)."
-  (handler-case
-      (list :ok
-            (if stream
-                (drain-stream-turn agent params on-token)
-                (agent-cl.llm:complete-turn (agent-transport agent) params)))
-    (agent-cl.core:agent-pause (p)
-      (list :error (format nil "paused: ~a" (agent-cl.core:agent-pause-reason p))))
-    (agent-cl.core:agent-error (e)
-      (list :error (agent-cl.core:agent-error-message e)))
-    (error (e)
-      (list :error (format nil "unexpected: ~a" e)))))
+  "One LLM round trip with automatic retry of transient transport failures
+  (5xx/429, i.e. transport-error with RETRYABLE-P). Retry count is bounded by
+  AGENT-CL.LLM:*MAX-RETRIES* and gated by the policy's ALLOW-MODEL-RETRY flag.
+  Returns (:ok turn-result) or (:error readable-reason)."
+  (let* ((policy (agent-policy agent))
+         (budget (if (policy-allow-model-retry policy)
+                     (or agent-cl.llm:*max-retries* 0)
+                     0))
+         (attempt 0))
+    (loop
+      (handler-case
+          (return
+            (list :ok
+                  (if stream
+                      (drain-stream-turn agent params on-token)
+                      (agent-cl.llm:complete-turn (agent-transport agent) params))))
+        (agent-cl.core:agent-pause (p)
+          (return (list :error
+                        (format nil "paused: ~a"
+                                (agent-cl.core:agent-pause-reason p)))))
+        (agent-cl.core:transport-error (e)
+          (let ((msg (agent-cl.core:agent-error-message e)))
+            (if (and (agent-cl.core:transport-error-retryable-p e)
+                     (< attempt budget))
+                (progn
+                  (incf attempt)
+                  (let ((backoff (min 8.0 (* 0.25 (expt 2 (1- attempt))))))
+                    (format t "~&[retry ~a/~a after ~,1fs] ~a~%"
+                            attempt budget backoff msg)
+                    (finish-output)
+                    (sleep backoff)))
+                (return (list :error (or msg (princ-to-string e)))))))
+        (agent-cl.core:agent-error (e)
+          (return (list :error (agent-cl.core:agent-error-message e))))
+        (error (e)
+          (return (list :error (format nil "unexpected: ~a" e))))))))
 
 (defun ask (agent text &key (stream nil) (on-token nil))
   "Single user utterance convenience wrapper around RUN."

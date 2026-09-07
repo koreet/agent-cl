@@ -115,6 +115,48 @@
       (ok (search "参数校验失败" (agent-cl.messages:msg-content (first tool-msgs))))))
   (unregister-tool "test.square"))
 
+(deftest engine-retries-transient-5xx-then-succeeds
+  "A retryable transport error (500) is retried automatically; the next script
+  entry succeeds and the run completes normally."
+  (let* ((tr (make-mock-transport
+              :script (list (script-error :status 500 :message "boom")
+                            (script-reply (reply-json "好了" nil)))))
+         (agent (make-agent :transport tr :tools nil
+                            :policy (make-policy :max-steps 3)))
+         (summary (run agent "重试我")))
+    (ok (done-p summary))
+    (is-equal 1 (steps summary))
+    (ok (search "好了" (final-content summary)))))
+
+(deftest engine-gives-up-after-retries-exhausted
+  "When every attempt fails with a retryable error, the run reports the last
+  failure instead of looping forever."
+  (let* ((tr (make-mock-transport
+              :script (list (script-error :status 503 :message "down1")
+                            (script-error :status 503 :message "down2")
+                            (script-error :status 503 :message "down3")
+                            (script-error :status 503 :message "down4"))))
+         (agent (make-agent :transport tr :tools nil
+                            :policy (make-policy :max-steps 3
+                                                 :allow-model-retry nil))))
+    ;; allow-model-retry nil -> no retry at all: single attempt, guard failure
+    (let ((summary (run agent "别重试")))
+      (ok (not (done-p summary)))
+      (ok (search "down1" (guard-reason summary))))))
+
+(deftest engine-retry-honors-max-retries-bound
+  (let* ((tr (make-mock-transport
+              :script (list (script-error :status 429 :message "rate1")
+                            (script-error :status 429 :message "rate2")
+                            (script-error :status 429 :message "rate3")
+                            (script-error :status 429 :message "rate4"))))
+         (agent (make-agent :transport tr :tools nil
+                            :policy (make-policy :max-steps 3))))
+    ;; default *max-retries* = 3 -> 1 + 3 = 4 total attempts, all fail
+    (let ((summary (run agent "限流")) )
+      (ok (not (done-p summary)))
+      (ok (search "rate4" (guard-reason summary))))))
+
 (deftest engine-max-steps-guard
   (register-test-tool "test.square"
                       (lambda (args ctx)
@@ -191,6 +233,43 @@
   (dolist (n '("shell.run" "file.read" "file.write" "time.now"))
     (unregister-tool n)))
 
+(deftest file-workspace-confinement
+  "file.read/write must refuse paths that leave *file-workspace-root* and
+  accept paths inside it; disabling the root re-enables arbitrary access."
+  (register-builtin-tools)
+  (let ((saved agent-cl.tools:*file-workspace-root*))
+    (unwind-protect
+         (progn
+           ;; 1) escape attempts are blocked with :error + reason
+           (multiple-value-bind (c s)
+               (agent-cl.tools:call-tool
+                "file.read"
+                (list :PATH (if (uiop:os-windows-p)
+                                "C:/Windows/System32/drivers/etc/hosts"
+                                "/etc/hosts")))
+             (is-equal :error s)
+             (ok (search "工作区外" c)))
+           ;; 2) inside the workspace works
+           (let ((p (format nil "~a/.tools/tmp-ws-check.txt"
+                            (namestring (uiop:getcwd)))))
+             (multiple-value-bind (c s)
+                 (agent-cl.tools:call-tool "file.write"
+                                           (list :PATH p :CONTENT "ok"))
+               (is-equal :ok s)
+               (ok (search "wrote" c)))
+             (multiple-value-bind (c s)
+                 (agent-cl.tools:call-tool "file.read" (list :PATH p))
+               (is-equal :ok s)
+               (is-equal "ok" c))
+             (ignore-errors (delete-file p)))
+           ;; 3) root NIL = confinement off
+           (agent-cl.tools:set-file-workspace-root nil)
+           (ok (null (agent-cl.tools:workspace-check
+                      (if (uiop:os-windows-p)
+                          "C:/Windows/win.ini" "/etc/hostname")))))
+      (setf agent-cl.tools:*file-workspace-root* saved)))
+  (dolist (n '("file.read" "file.write")) (unregister-tool n)))
+
 
 ;;; ---------------------------------------------------------------------------
 ;;; M5: memory budget — window and token trimming feed the real request
@@ -265,6 +344,43 @@
                                 (list :CODE "print(undefined_name(" :LANGUAGE "python"))
     (is-equal :error status)
     (ok (search "exit" content))))
+
+(deftest run-program-watchdog-kills-on-timeout
+  ;; uiop :timeout is a no-op on Windows; our watchdog must actually return
+  ;; :timeout and keep the host responsive afterwards.
+  (let ((t0 (get-internal-real-time)))
+    (multiple-value-bind (out err exit)
+        (agent-cl.core:run-program-with-timeout
+         (if (uiop:os-windows-p)
+             (list "ping" "-n" "30" "127.0.0.1")
+             (list "sleep" "30"))
+         :timeout 3)
+      (declare (ignore out err))
+      (is-equal :timeout exit)
+      (ok (< (/ (- (get-internal-real-time) t0)
+                internal-time-units-per-second)
+             20))))
+  ;; host still works afterwards (child really was killed)
+  (multiple-value-bind (_ e2 exit2)
+      (agent-cl.core:run-program-with-timeout
+       (if (uiop:os-windows-p)
+           (list "cmd" "/c" "echo alive")
+           (list "echo" "alive"))
+       :timeout 10)
+    (declare (ignore _ e2))
+    (is-equal 0 exit2)))
+
+(deftest code-exec-timeout-returns-error-not-hang
+  ;; a model-supplied TIMEOUT must be honored at the tool layer too
+  (multiple-value-bind (content status)
+      (agent-cl.tools:call-tool "code.exec"
+                                (list :CODE (if (uiop:os-windows-p)
+                                                "import time; time.sleep(30)"
+                                                "import time; time.sleep(30)")
+                                      :LANGUAGE "python"
+                                      :TIMEOUT 2))
+    (is-equal :error status)
+    (ok (search "timeout" content))))
 
 (deftest code-exec-engine-roundtrip-mock
   ;; model asks for code, engine dispatches code.exec, result fed back to model
@@ -389,10 +505,42 @@
   (dolist (n '("memory.set" "memory.recall"))
     (unregister-tool n)))
 
-
-;;; ---------------------------------------------------------------------------
-;;; web.search（注册 + 无 dexador 的确定性错误路径；真实检索需可联网环境）
-;;; ---------------------------------------------------------------------------
+(deftest memory-keys-no-longer-collide
+  "Regression: keys differing only by punctuation used to sanitize to the same
+  filename (a-b / a b / a/b -> a_b.json) and silently overwrite each other.
+  The filename encoding must now be injective."
+  (agent-cl.tools:register-builtin-tools)
+  (let ((home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME")))
+        (keys '("u-k1" "u k2" "u/k3" "u.k4"))
+        (dir (merge-pathnames ".agent-cl/memory/"
+                              (uiop:ensure-directory-pathname
+                               (or (uiop:getenv "USERPROFILE")
+                                   (uiop:getenv "HOME"))))))
+    (unwind-protect
+         (progn
+           (dolist (k keys)
+             (multiple-value-bind (c s)
+                 (agent-cl.tools:call-tool "memory.set" (list :KEY k :VALUE k))
+               (is-equal :ok s)
+               (ok (search "saved" c))))
+           ;; each key must round-trip its own value (no cross-key overwrite)
+           (dolist (k keys)
+             (multiple-value-bind (c s)
+                 (agent-cl.tools:call-tool "memory.recall" (list :KEY k))
+               (is-equal :ok s)
+               (is-equal k c))))
+      ;; cleanup: remove every file created for the u-k1/u k2/u/k3/u.k4 keys
+      (dolist (k keys)
+        (let* ((safe (with-output-to-string (o)
+                       (loop for ch across k
+                             do (if (or (alphanumericp ch)
+                                        (member ch '(#\- #\_ #\.)))
+                                    (write-char ch o)
+                                    (format o "~2,'0x" (char-code ch))))))
+               (f (merge-pathnames (format nil "~a.json" safe) dir)))
+          (ignore-errors (delete-file f))))))
+  (dolist (n '("memory.set" "memory.recall"))
+    (unregister-tool n)))
 
 (deftest web-search-registered-and-errors-without-http
   (agent-cl.tools:register-builtin-tools)

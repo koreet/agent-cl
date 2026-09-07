@@ -9,12 +9,13 @@
 ## 现代 Agent 功能（实现清单）
 
 - **ReAct 引擎 + 工具调用**：内置 shell/file/time/code.exec(写代码执行)/memory.set|recall(跨会话记忆)/web.search(免 key DuckDuckGo)/task.delegate(子 agent 独立会话，只回结论省 token)
-- **Plan-then-Execute**：REPL `/plan <任务>`：拆步骤→逐步执行→汇总
+- **Plan-then-Execute**：REPL `/plan <任务>`：拆步骤→逐步执行→汇总（步骤在一次性子会话执行，不污染主历史）
 - **长会话自动压缩**：超预算自动把旧消息凝成摘要（`/compact` 手动、`/budget` 调阈值）
 - **流式输出 + Markdown 渲染**：SSE 逐字输出；标题/粗体/行内码/代码块（关键字着色）/表格行着色（`NO_COLOR=1` 或 `/color off` 关闭）
 - **REPL 命令面板**：`/help /tools /memory /export <f> /load <f> /new /compact /budget /plan /color /quit`
-- **会话导出/载入**：JSONL 往返，可复盘/换机续聊
+- **会话导出/载入**：JSONL 往返（载入自动净化被截断的会话），可复盘/换机续聊
 - 工具执行可视化（`[tool xxx -> OK]`）、Ctrl-C 优雅退出
+- **可靠性**：瞬态 5xx/429 自动指数退避重试（`*max-retries*`，可经 policy 关闭）；shell/code.exec 有真实超时看门狗（Windows 下 uiop 超时失效的替代，超时杀进程树）；file.read/write 默认限制在仓库根工作区内（`set-file-workspace-root nil` 放开）
 
 `task.delegate`/`/plan` 等真实能力需联网模型（默认 DeepSeek）验证；mock 套件覆盖协议/引擎确定性语义。
 
@@ -30,7 +31,7 @@
 | M5 | 记忆预算/自动压缩（`/compact`/`/budget`）+ Plan-then-Execute（`/plan`） | ✅ |
 | M6 | 真实 API 冒烟 + Windows 11 真机全量回归 | ✅ DeepSeek 端到端通过——SBCL 进程内 dexador+cl+ssl 直连（`scripts/smoke.lisp` 优先 dexador，缺依赖回退 node 钩子）；回归实录见 `docs/architecture.md` §14 |
 
-**测试**：`55/55` 通过（`scripts/run-tests.lisp` 或 `.\start.ps1 -Mode test`，全部 mock 确定性测试）+ 真实 DeepSeek 冒烟 `[SMOKE-OK]`（Windows 11 真机全量回归记录见 `docs/architecture.md` §14）。
+**测试**：`66/66` 通过（`scripts/run-tests.lisp` 或 `.\start.ps1 -Mode test`，全部 mock 确定性测试）+ 真实 DeepSeek 冒烟 `[SMOKE-OK]`（Windows 11 真机全量回归记录见 `docs/architecture.md` §14）。
 
 **工具名映射**：DeepSeek/OpenAI 要求函数名匹配 `^[a-zA-Z0-9_-]+$`，因此 DSL 点号工具名（如 `time.now`）在线上边界自动映射为 `time_now`（`src/tools/registry.lisp` 的 `sanitize-tool-name`/`find-tool` 反向查找），本地 DSL 命名不受影响。
 
@@ -38,7 +39,7 @@
 
 ```powershell
 cd C:\...\agent-cl
-.\start.ps1 -Mode test      # 55 个 mock 确定性测试（无需 key、无需网络）
+.\start.ps1 -Mode test      # 66 个 mock 确定性测试（无需 key、无需网络）
 # 或直接：
 & (Get-Command sbcl).Source --script scripts\run-tests.lisp
 ```
@@ -75,7 +76,7 @@ cd C:\...\agent-cl
 cd C:\...\agent-cl
 .\start.ps1                 # 交互式 REPL（真实对话，自动接 dexador 直连）
 .\start.ps1 -Mode smoke     # 真实 API 冒烟（需 key）
-.\start.ps1 -Mode test      # 55 个 mock 确定性测试（无需 key）
+.\start.ps1 -Mode test      # 66 个 mock 确定性测试（无需 key）
 .\start.ps1 -Key sk-xxxx    # 临时指定 key
 start.bat                   # 等价（可双击，参数透传）
 ```

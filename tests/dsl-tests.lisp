@@ -196,3 +196,13 @@
     (is-equal "number" (gethash "type" (gethash "items" wire)))
     (ok (json-valid-p schema (list 1 2 3)))
     (ok (not (json-valid-p schema (list 1 "two"))))))
+
+(deftest schema-integer-tolerates-integral-float
+  ;; models frequently emit 3.0 for an :integer property; that must validate
+  ;; (only a genuinely fractional value like 3.5 should be rejected)
+  (let ((schema (make-schema :kind :object
+                             :properties '(("n" (:type :integer)))
+                             :required nil)))
+    (ok (json-valid-p schema (decode-to-plist "{\"n\": 3.0}")))
+    (ok (json-valid-p schema (decode-to-plist "{\"n\": 3}")))
+    (ok (not (json-valid-p schema (decode-to-plist "{\"n\": 3.5}"))))))

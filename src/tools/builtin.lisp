@@ -22,6 +22,55 @@
       :properties (list ,@(nreverse props))
       :required (list ,@(nreverse required)))))
 
+;; ---------------------------------------------------------------------------
+;; file tools workspace confinement
+;; ---------------------------------------------------------------------------
+
+(defparameter *file-workspace-root* (uiop:getcwd)
+  "Root directory file.read/file.write may touch. Defaults to the current
+  working directory (the repo root when launched via start.ps1); set to NIL to
+  disable confinement (agent then reads/writes anywhere the process may).")
+
+(defun set-file-workspace-root (path)
+  (setf *file-workspace-root*
+        (and path (uiop:ensure-directory-pathname path))))
+
+(defun native->slashed (path)
+  "Best-effort normalize a filesystem path string for prefix comparison."
+  (let* ((s (if (pathnamep path) (namestring path)
+                (if (stringp path) path (princ-to-string path))))
+         (slashed (string-downcase (substitute #\/ #\\ s))))
+    ;; collapse duplicate separators so agent-cl//.tools == agent-cl/.tools
+    (let ((out (make-string-output-stream))
+          (prev #\Space))
+      (loop for ch across slashed
+            do (unless (and (char= ch #\/) (char= prev #\/))
+                 (write-char ch out))
+               (setf prev ch))
+      (get-output-stream-string out))))
+
+(defun strip-trailing-slashes (s)
+  (string-right-trim '(#\/) s))
+
+(defun workspace-check (path)
+  "Return an error string if PATH is not inside the workspace, else NIL.
+  Both absolute and relative forms are confined."
+  (when (null *file-workspace-root*)
+    (return-from workspace-check nil))
+  (let* ((root (strip-trailing-slashes (native->slashed *file-workspace-root*)))
+         (raw (if (stringp path) path (princ-to-string path)))
+         (merged (if (uiop:absolute-pathname-p (pathname raw))
+                     raw
+                     (namestring (merge-pathnames raw *file-workspace-root*))))
+         (cand (native->slashed merged)))
+    (unless (or (string= cand root)
+                (and (> (length cand) (length root))
+                     (string= cand root
+                              :end1 (length root) :end2 (length root))
+                     (char= (char cand (length root)) #\/)))
+      (format nil "拒绝访问工作区外路径 ~a（允许范围 ~a；如需放开请 set-file-workspace-root nil）"
+              path root))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; shell.run
 ;;; ---------------------------------------------------------------------------
@@ -36,13 +85,11 @@
                     (list "cmd" "/c" cmd)
                     (list "/bin/sh" "-c" cmd))))
       (multiple-value-bind (out err exit)
-          (uiop:run-program argv
-                            :output :string
-                            :error-output :string
-                            :directory (or cwd (namestring (uiop:getcwd)))
-                            :ignore-error-status t
-                            :timeout (or (getf args :TIMEOUT) 60))
-        (if (and (zerop exit) (null err))
+          (agent-cl.core:run-program-with-timeout
+           argv
+           :timeout (or (getf args :TIMEOUT) 60)
+           :directory (or cwd (namestring (uiop:getcwd))))
+        (if (and (integerp exit) (zerop exit) (null err))
             (values (string-right-trim '(#\Newline #\Return) out) :ok)
             (values (format nil "exit ~a~%stdout: ~a~%stderr: ~a" exit out err)
                     :error))))))
@@ -56,9 +103,12 @@
   (let ((path (getf args :PATH)))
     (unless path
       (return-from read-file (values "missing :path" :error)))
-    (handler-case
-        (values (agent-cl.core:read-file-string path) :ok)
-      (error (e) (values (format nil "cannot read ~a: ~a" path e) :error)))))
+    (let ((escape (workspace-check path)))
+      (if escape
+          (values escape :error)
+          (handler-case
+              (values (agent-cl.core:read-file-string path) :ok)
+            (error (e) (values (format nil "cannot read ~a: ~a" path e) :error)))))))
 
 (defun write-file (args ctx)
   (declare (ignore ctx))
@@ -66,13 +116,16 @@
         (content (getf args :CONTENT)))
     (unless (and path content)
       (return-from write-file (values "missing :path/:content" :error)))
-    (handler-case
-        (progn
-          (agent-cl.core:write-file-string path content)
-          (values (format nil "wrote ~a bytes to ~a"
-                          (agent-cl.core:utf8-byte-length content) path)
-                  :ok))
-      (error (e) (values (format nil "cannot write ~a: ~a" path e) :error)))))
+    (let ((escape (workspace-check path)))
+      (if escape
+          (values escape :error)
+          (handler-case
+              (progn
+                (agent-cl.core:write-file-string path content)
+                (values (format nil "wrote ~a bytes to ~a"
+                                (agent-cl.core:utf8-byte-length content) path)
+                        :ok))
+            (error (e) (values (format nil "cannot write ~a: ~a" path e) :error)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; time.now
@@ -145,21 +198,22 @@
                (declare (ignore ext))
                (multiple-value-bind (out err exit)
                    (handler-case
-                       (uiop:run-program argv
-                                         :output :string
-                                         :error-output :string
-                                         :ignore-error-status t
-                                         :timeout timeout)
+                       (agent-cl.core:run-program-with-timeout argv
+                                                        :timeout timeout)
                      (error (e)
                        (return-from code-exec
                          (values (format nil "cannot run ~a: ~a" language e)
                                  :error))))
                  (let* ((clean-err (string-trim '(#\Space #\Tab #\Newline #\Return)
                                                 (or err "")))
+                        (timed-out (eq exit :timeout))
+                        (exit-label (if timed-out "timeout"
+                                        (princ-to-string exit)))
                         (text (format nil "~a~@[~%--- stderr ---~%~a~]~%[exit ~a]"
                                       out (and (plusp (length clean-err)) clean-err)
-                                      exit)))
-                   (if (and (zerop exit) (zerop (length clean-err)))
+                                      exit-label)))
+                   (if (and (integerp exit) (zerop exit)
+                            (zerop (length clean-err)))
                        (values text :ok)
                        (values text :error))))))
         (ignore-errors (delete-file file))))))
@@ -230,8 +284,17 @@
     d))
 
 (defun memory-key-file (key)
-  (let* ((safe (map 'string (lambda (c) (if (alphanumericp c) c #\_))
-                    (if (stringp key) key (princ-to-string key)))))
+  "Map KEY to a file path under the memory dir. The filename is an injective
+  (reversible) encoding: [A-Za-z0-9._-] stay literal, any other char becomes
+  its lowercase 2-digit hex code — so 'a-b', 'a b', 'a/b' never collide (they
+  previously all collapsed to a_b.json and silently overwrote each other)."
+  (let* ((s (if (stringp key) key (princ-to-string key)))
+         (safe (with-output-to-string (out)
+                 (loop for ch across s
+                       do (if (or (alphanumericp ch)
+                                  (member ch '(#\- #\_ #\.)))
+                              (write-char ch out)
+                              (format out "~2,'0x" (char-code ch)))))))
     (merge-pathnames (format nil "~a.json" safe) (memory-dir))))
 
 (defun memory-store (args ctx)
@@ -241,9 +304,18 @@
     (unless (and key value)
       (return-from memory-store (values "missing :key/:value" :error)))
     (handler-case
-        (progn
-          (agent-cl.core:write-file-string (memory-key-file key) value)
-          (values (format nil "saved ~a" key) :ok))
+        (let ((target (memory-key-file key))
+              (tmp (merge-pathnames
+                    (format nil "~a.tmp" (agent-cl.core:uuid-string))
+                    (memory-dir))))
+          ;; atomic write: write temp then rename, so concurrent readers never
+          ;; observe a truncated / half-written file
+          (unwind-protect
+               (progn
+                 (agent-cl.core:write-file-string tmp value)
+                 (uiop:rename-file-overwriting-target tmp target)
+                 (values (format nil "saved ~a" key) :ok))
+            (ignore-errors (delete-file tmp))))
       (error (e) (values (format nil "memory write failed: ~a" e) :error)))))
 
 (defun memory-recall (args ctx)
@@ -271,10 +343,11 @@
                       :parameters (make-builtin-params
                                    ("path" :string :description "file path" :required t)))
            (make-tool "file.write" #'write-file
-                      :description "Write text content to a UTF-8 file, creating parent directories."
+                      :description "Write text content to a UTF-8 file (confined to the workspace root unless set-file-workspace-root nil), creating parent directories. DANGEROUS: can overwrite existing files."
                       :parameters (make-builtin-params
                                    ("path" :string :description "file path" :required t)
-                                   ("content" :string :description "content to write" :required t)))
+                                   ("content" :string :description "content to write" :required t))
+                      :dangerous-p t)
            (make-tool "time.now" #'now-time
                       :description "Return the current UTC time as an ISO-8601 string."
                       :parameters (make-builtin-params))

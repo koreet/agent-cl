@@ -38,7 +38,9 @@
 
 (defun json-decode (string)
   "Decode a JSON string. Objects become hash-tables (equal test), arrays
-  become lists, booleans T/NIL, numbers numbers, null -> :null."
+  become lists, booleans T/NIL, numbers numbers. Verified with yason: JSON
+  null decodes to NIL (indistinguishable from absent/false for consumers that
+  do not use :null sentinels — acceptable for optional fields)."
   (yason:parse string))
 
 (defun object-to-plist (decoded &key (string-keys nil))

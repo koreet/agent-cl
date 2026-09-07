@@ -27,22 +27,50 @@
   (format nil "https://html.duckduckgo.com/html/?q=~a" (pct-encode query)))
 
 (defun html-entity-decode (s)
+  "Decode common HTML entities: &lt; &gt; &amp; &quot; &#39; &nbsp; and
+  decimal numeric entities (&#NN;). Unknown entities are left as-is."
   (let ((out (make-string-output-stream)))
     (loop with i = 0 and n = (length s)
           while (< i n)
           do (let ((ch (char s i)))
                (cond
                  ((and (char= ch #\&) (< (+ i 3) n))
-                  (cond ((and (char= (char s (1+ i)) #\l) (char= (char s (+ i 2)) #\t))
-                         (write-char #\< out) (incf i 4))
-                        ((and (char= (char s (1+ i)) #\g) (char= (char s (+ i 2)) #\t))
-                         (write-char #\> out) (incf i 4))
-                        ((and (char= (char s (1+ i)) #\a) (char= (char s (+ i 2)) #\m)
-                              (char= (char s (+ i 3)) #\p))
-                         (write-char #\& out) (incf i 5))
-                        (t (write-char ch out) (incf i))))
+                  (let ((rest (subseq s (1+ i) (min n (+ i 8)))))
+                    (cond
+                      ((string-prefix-p "lt;" rest)
+                       (write-char #\< out) (incf i 4))
+                      ((string-prefix-p "gt;" rest)
+                       (write-char #\> out) (incf i 4))
+                      ((string-prefix-p "amp;" rest)
+                       (write-char #\& out) (incf i 5))
+                      ((string-prefix-p "quot;" rest)
+                       (write-char #\" out) (incf i 6))
+                      ((string-prefix-p "apos;" rest)
+                       (write-char #\' out) (incf i 6))
+                      ((string-prefix-p "nbsp;" rest)
+                       (write-char #\Space out) (incf i 6))
+                      ((and (char= (char rest 0) #\#) (plusp (length rest)))
+                       ;; &#NN; numeric (decimal)
+                       (let ((semi (position #\; rest :start 1)))
+                         (if (and semi
+                                  (every (lambda (c)
+                                           (digit-char-p c))
+                                         (subseq rest 1 semi)))
+                             (progn
+                               (write-char
+                                (code-char (parse-integer
+                                            (subseq rest 1 semi)))
+                                out)
+                               (incf i (+ 1 semi 1)))
+                             (progn (write-char ch out) (incf i)))))
+                      (t (write-char ch out) (incf i)))))
                  (t (write-char ch out) (incf i))))
           finally (return (get-output-stream-string out)))))
+
+(defun string-prefix-p (prefix s)
+  "T when S starts with PREFIX."
+  (and (>= (length s) (length prefix))
+       (string= prefix s :end2 (length prefix))))
 
 (defun strip-tags (s)
   (let ((out (make-string-output-stream))

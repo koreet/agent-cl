@@ -55,6 +55,9 @@
 
 (defun script-reply (json-string) (list :reply json-string))
 (defun script-stream (lines) (list :stream lines))
+(defun script-error (&key (status 500) (message "mock http error") (retryable t))
+  "Scenario that signals a TRANSPORT-ERROR; used to exercise engine retry."
+  (list :error status message retryable))
 
 ;;; ---------------------------------------------------------------------------
 ;;; perform-request
@@ -99,23 +102,29 @@
       (error 'agent-cl.core:transport-error
              :message "mock transport script exhausted"
              :retryable nil))
-    (destructuring-bind (kind payload) scenario
-      (ecase kind
-        (:reply
-         (when (getf params :stream)
-           (error 'agent-cl.core:transport-error
-                  :message "mock scenario :reply used with :stream t"
-                  :retryable nil))
-         (parse-chat-json payload))
-        (:stream
-         (unless (getf params :stream)
-           (error 'agent-cl.core:transport-error
-                  :message "mock scenario :stream used without :stream t"
-                  :retryable nil))
-         (let ((turn (make-instance 'streaming-turn)))
-           (setf (slot-value turn 'line-source)
-                 (let ((lines payload)) (lambda () (pop lines))))
-           turn))))))
+    (if (eq (first scenario) :error)
+        ;; (:error status message retryable) — signals so the engine can retry
+        (destructuring-bind (_ status message retryable) scenario
+          (declare (ignore _))
+          (error 'agent-cl.core:transport-error
+                 :message message :status status :retryable retryable))
+        (destructuring-bind (kind payload) scenario
+          (ecase kind
+            (:reply
+             (when (getf params :stream)
+               (error 'agent-cl.core:transport-error
+                      :message "mock scenario :reply used with :stream t"
+                      :retryable nil))
+             (parse-chat-json payload))
+            (:stream
+             (unless (getf params :stream)
+               (error 'agent-cl.core:transport-error
+                      :message "mock scenario :stream used without :stream t"
+                      :retryable nil))
+             (let ((turn (make-instance 'streaming-turn)))
+               (setf (slot-value turn 'line-source)
+                     (let ((lines payload)) (lambda () (pop lines))))
+               turn)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; streaming driver
