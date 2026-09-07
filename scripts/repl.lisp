@@ -77,9 +77,19 @@
 (defclass repl-agent (agent-cl.loop:agent) ())
 
 (defmethod agent-cl.loop:on-tool-result ((a repl-agent) tool-name result-plist)
-  "REPL 里把工具执行可视化（流式进行中也会出现）。"
+  "REPL 里把工具执行可视化（流式进行中也会出现）。失败时打印具体原因，
+  否则用户只能看到 ERROR 而不知道工具为什么失败。"
   (declare (ignore a))
-  (format t "~&  [tool ~a -> ~a]~%" tool-name (getf result-plist :status))
+  (let ((status (getf result-plist :status))
+        (content (getf result-plist :content)))
+    (if (eq status :ok)
+        (format t "~&  [tool ~a -> OK]~%" tool-name)
+        (progn
+          (format t "~&  [tool ~a -> ~a]~%" tool-name status)
+          ;; 失败详情对用户排查至关重要：截断显示，避免超长内容刷屏
+          (when content
+            (format t "    ~a~%"
+                    (subseq content 0 (min 400 (length content))))))))
   (finish-output))
 
 (defparameter *repl-system-prompt*

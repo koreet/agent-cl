@@ -382,6 +382,31 @@
     (is-equal :error status)
     (ok (search "timeout" content))))
 
+(deftest shell-run-success-reports-ok
+  ;; regression: a successful command with empty stderr must be :ok — the
+  ;; watchdog returns stderr as "" (not NIL), which earlier mislabelled every
+  ;; successful shell.run as :error and left users with unexplained tool errors.
+  (agent-cl.tools:register-builtin-tools)
+  (multiple-value-bind (content status)
+      (agent-cl.tools:call-tool "shell.run"
+                                (list :CMD (if (uiop:os-windows-p)
+                                               "echo shell-ok-test"
+                                               "echo shell-ok-test")
+                                      :TIMEOUT 15))
+    (is-equal :ok status)
+    (ok (search "shell-ok-test" content))))
+
+(deftest shell-run-failure-reports-stderr
+  ;; a genuinely failing command must stay :error and carry the stderr detail
+  (multiple-value-bind (content status)
+      (agent-cl.tools:call-tool "shell.run"
+                                (list :CMD (if (uiop:os-windows-p)
+                                               "no-such-command-xyz-123"
+                                               "no-such-command-xyz-123")
+                                      :TIMEOUT 15))
+    (is-equal :error status)
+    (ok (search "exit" content))))
+
 (deftest code-exec-engine-roundtrip-mock
   ;; model asks for code, engine dispatches code.exec, result fed back to model
   (agent-cl.tools:register-builtin-tools)

@@ -89,7 +89,8 @@
            argv
            :timeout (or (getf args :TIMEOUT) 60)
            :directory (or cwd (namestring (uiop:getcwd))))
-        (if (and (integerp exit) (zerop exit) (null err))
+        (if (and (integerp exit) (zerop exit)
+                 (or (null err) (string= err "")))
             (values (string-right-trim '(#\Newline #\Return) out) :ok)
             (values (format nil "exit ~a~%stdout: ~a~%stderr: ~a" exit out err)
                     :error))))))
