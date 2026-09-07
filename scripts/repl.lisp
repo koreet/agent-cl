@@ -334,6 +334,82 @@
     (setf (agent-cl.loop:agent-messages agent) msgs)
     (format t "~&已载入 ~a 条消息~%" (length msgs))))
 
+(defun session-root ()
+  "REPL 会话根目录：~/.agent-cl/sessions/（仓库外，随用户持久）。"
+  (let ((d (merge-pathnames ".agent-cl/sessions/"
+                            (uiop:ensure-directory-pathname
+                             (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME"))))))
+    (ensure-directories-exist d)
+    d))
+
+(defvar *repl-session* nil
+  "当前 REPL 会话对象（agent-cl.session:session）。")
+(defvar *persisted-count* 0
+  "已写入当前会话的消息条数（增量持久用）。")
+
+(defun repl-new-session (agent)
+  "开始一个新会话：把当前 agent 消息清空并绑定新 session id。"
+  (when (and agent *repl-session*)
+    ;; 先把旧会话落一个 checkpoint，便于审计结束点
+    (handler-case
+        (agent-cl.session:save-checkpoint *repl-session* "switched-away")
+      (error () nil)))
+  (setf *repl-session* (agent-cl.session:make-session
+                        :directory (session-root)))
+  (setf *persisted-count* 0)
+  (when agent (setf (agent-cl.loop:agent-messages agent) nil))
+  (format t "~&[session] 新会话 ~a~%" (agent-cl.session:session-id *repl-session*))
+  *repl-session*)
+
+(defun repl-persist-turn (agent)
+  "把 agent-messages 里尚未落盘的消息追加进当前会话（增量，事件日志式）。"
+  (let ((s *repl-session*))
+    (when (and s agent)
+      (let ((msgs (agent-cl.loop:agent-messages agent)))
+        (loop for m in (nthcdr (min *persisted-count* (length msgs)) msgs)
+              do (handler-case
+                     (agent-cl.session:persist-message s m)
+                   (error () nil)))
+        (setf *persisted-count* (length msgs))))))
+
+(defun repl-session-line (s)
+  "一行会话预览：id · 消息数 · 首句 · 最后事件时间。"
+  (let* ((n (agent-cl.session:session-message-count s))
+         (first-user (agent-cl.session:session-first-user-text s))
+         (ts (agent-cl.session:session-last-ts s))
+         (preview (if first-user
+                      (subseq first-user 0 (min 40 (length first-user)))
+                      "(空)")))
+    (format nil "~a  [~a 条]  ~a  ~a"
+            (agent-cl.session:session-id s) n preview
+            (or ts ""))))
+
+(defun repl-list-sessions ()
+  "列出 ~/.agent-cl/sessions 下全部会话。"
+  (let ((ids (sort (agent-cl.session:session-ids (session-root)) #'string>)))
+    (if ids
+        (progn
+          (format t "~&已保存会话（共 ~a 个）：~%" (length ids))
+          (dolist (id ids)
+            (handler-case
+                (let ((s (agent-cl.session:load-session
+                          id :directory (session-root))))
+                  (format t "  ~a~%" (repl-session-line s)))
+              (error (e)
+                (format t "  ~a  [读取失败: ~a]~%" id e)))))
+        (format t "~&还没有已保存的会话。~%"))))
+
+(defun repl-use-session (agent id)
+  "切换到 ID 会话：先存当前会话，再载入目标历史续聊。"
+  (repl-persist-turn agent)   ; 存当前 agent 未落盘消息
+  (let ((s (agent-cl.session:load-session id :directory (session-root))))
+    (setf *repl-session* s)
+    (let ((history (agent-cl.session:replayed-messages s)))
+      (setf (agent-cl.loop:agent-messages agent) history)
+      (setf *persisted-count* (length history))
+      (format t "~&[session] 已切换到 ~a（~a 条历史）~%"
+              id (length history)))))
+
 (defun list-memory-keys ()
   (let* ((home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME")))
          (dir (merge-pathnames ".agent-cl/memory/"
@@ -349,7 +425,9 @@
   (format t "  /memory        列出跨会话记忆键~%")
   (format t "  /export <file> 把当前会话导出为 JSONL~%")
   (format t "  /load <file>   载入 JSONL 会话继续对话~%")
-  (format t "  /new           清空当前会话~%")
+  (format t "  /new           另起新会话（当前自动存档）~%")
+  (format t "  /sessions      列出已保存会话~%")
+  (format t "  /use <id>      切换到指定会话（继续之前的对话）~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
   (format t "  /quit 或 /exit 退出~%"))
@@ -374,8 +452,12 @@
            (import-transcript agent rest)
            (format t "~&用法: /load <file.jsonl>（文件不存在）~%")))
       ((string= cmd "/new")
-       (setf (agent-cl.loop:agent-messages agent) nil)
-       (format t "~&已清空当前会话~%"))
+       (repl-new-session agent))
+      ((string= cmd "/sessions")
+       (repl-list-sessions))
+      ((string= cmd "/use")
+       (if rest (repl-use-session agent rest)
+           (format t "~&用法: /use <session-id>（/sessions 查看）~%")))
       ((string= cmd "/plan")
        (let ((f (and rest (find-symbol "RUN-PLANNED" "AGENT-CL.PLAN"))))
          (if f
@@ -395,31 +477,36 @@
 
 
 (defun ask-turn (agent line)
-  (reset-tokens)
-  (handler-case
-      (let ((summary (agent-cl.loop:ask agent line :stream t
-                                        :on-token #'repl-on-token)))
-        (flush-tokens)
-        (when (not (agent-cl.loop:done-p summary))
-          (format t "~&[agent 未完成: ~a]~%"
-                  (agent-cl.loop:guard-reason summary))))
-    (error (e)
-      (format t "~&[stream fallback: ~a]~%" e)
-      (reset-tokens)
-      (handler-case
-          (let ((summary (agent-cl.loop:ask agent line)))
-            (if (agent-cl.loop:done-p summary)
-                (render-md-text (or (agent-cl.loop:final-content summary) ""))
-                (format t "~&[agent 未完成: ~a]~%"
-                        (agent-cl.loop:guard-reason summary))))
-        (error (e2)
-          (format t "~&agent> [error] ~a~%" e2))))))
+  (unwind-protect
+       (progn
+         (reset-tokens)
+         (handler-case
+             (let ((summary (agent-cl.loop:ask agent line :stream t
+                                               :on-token #'repl-on-token)))
+               (flush-tokens)
+               (when (not (agent-cl.loop:done-p summary))
+                 (format t "~&[agent 未完成: ~a]~%"
+                         (agent-cl.loop:guard-reason summary))))
+           (error (e)
+             (format t "~&[stream fallback: ~a]~%" e)
+             (reset-tokens)
+             (handler-case
+                 (let ((summary (agent-cl.loop:ask agent line)))
+                   (if (agent-cl.loop:done-p summary)
+                       (render-md-text (or (agent-cl.loop:final-content summary) ""))
+                       (format t "~&[agent 未完成: ~a]~%"
+                               (agent-cl.loop:guard-reason summary))))
+               (error (e2)
+                 (format t "~&agent> [error] ~a~%" e2))))))
+    ;; 每轮结束把本轮新消息（含 user 提问与工具往返）持久化到当前会话
+    (repl-persist-turn agent)))
 
 ;; ---------------------------------------------------------------------------
 ;; 主循环
 ;; ---------------------------------------------------------------------------
 (handler-case
     (let ((agent (make-repl-agent)))
+      (repl-new-session agent)
       (format t "~&Agent-CL REPL — 输入任务；/help 查看命令；空行退出；Ctrl-C 中断。~%")
       (format t "流式输出 + Markdown 着色已启用（/color off 关闭）。~%")
       (loop

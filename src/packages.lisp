@@ -149,7 +149,9 @@
   (:export
    #:session #:make-session #:session-id #:session-path
    #:session-append #:session-replay #:open-session #:save-checkpoint
-   #:persist-message #:replayed-messages #:message->event #:event->message))
+   #:persist-message #:replayed-messages #:message->event #:event->message
+   #:session-ids #:load-session #:session-first-user-text
+   #:session-message-count #:session-last-ts))
 
 (defpackage #:agent-cl
   (:use #:cl)

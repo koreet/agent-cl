@@ -134,3 +134,48 @@
   (loop for e in (session-events session)
         when (string= (getf e :TYPE) "message")
           collect (event->message e)))
+
+;; ---------------------------------------------------------------------------
+;; session discovery / summaries (REPL multi-session switching)
+;; ---------------------------------------------------------------------------
+
+(defun session-ids (directory)
+  "All existing session ids under DIRECTORY (alphabetical)."
+  (let ((root (uiop:ensure-directory-pathname
+               (or directory *default-session-root*))))
+    (when (uiop:directory-exists-p root)
+      (loop for sub in (uiop:subdirectories root)
+            when (uiop:file-exists-p
+                  (merge-pathnames "events.jsonl" sub))
+              ;; sub is ".../sessions/<id>/": take the <id> directory name
+              collect (let* ((dn (directory-namestring sub))
+                             (trimmed (string-right-trim '(#\/ #\\) dn))
+                             (last-sep (position-if
+                                        (lambda (c) (or (char= c #\/)
+                                                        (char= c #\\)))
+                                        trimmed :from-end t)))
+                        (subseq trimmed (1+ (or last-sep -1))))))))
+
+(defun load-session (id &key (directory *default-session-root*))
+  "Open (creating if needed) and return the session object for ID."
+  (open-session id :directory directory))
+
+(defun session-first-user-text (session)
+  "First user message content of SESSION (for list previews), or NIL."
+  (let ((m (find-if (lambda (e) (string= (getf e :TYPE) "message"))
+                    (session-events session))))
+    (when m
+      (let ((r (getf m :ROLE)))
+        (when (and r (string= r "user"))
+          (let ((c (getf m :CONTENT)))
+            (and c (string-trim '(#\Space #\Tab #\Newline #\Return #\")
+                                 (subseq c 0 (min 40 (length c)))))))))))
+
+(defun session-message-count (session)
+  (count-if (lambda (e) (string= (getf e :TYPE) "message"))
+            (session-events session)))
+
+(defun session-last-ts (session)
+  "Timestamp of the last event, or NIL."
+  (let ((last (first (last (session-events session)))))
+    (and last (getf last :TS))))
