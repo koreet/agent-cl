@@ -46,6 +46,9 @@
    (:file "dsl/macros")
    ;; ---- session ----
    (:file "session/store")
+   ;; ---- markdown line classifier (pure, fenced-code aware) ----
+   (:file "render/engine")
+
    ;; ---- self-improvement (safe, gate-guarded single-file patches) ----
    (:file "selfimprove/engine")))
 
@@ -63,4 +66,5 @@
    (:file "engine-tests")
    (:file "dsl-tests")
    (:file "session-tests")
+   (:file "render-tests")
    (:file "selfimprove-tests")))

@@ -172,3 +172,15 @@
    #:make-git-style-backup-dir
    ;; optional production gate: run the real repo test suite in a subprocess
    #:real-gate-runner))
+
+(defpackage #:agent-cl.render
+  (:use #:cl)
+  (:export
+   ;; pure, IO-free markdown -> logical-line classifier (fenced-code aware)
+   #:md-line                            ; struct type + accessors
+   #:make-md-line #:md-line-kind #:md-line-text
+   #:fence-open-p #:fence-close-p
+   ;; deterministic state-classification (pure)
+   #:classify-block #:classify-lines #:classify-one
+   #:+fence-out+ #:+fence-in+))
+

@@ -176,9 +176,22 @@
         (when bold (write-string (esc 0) out))   ; 未闭合 ** 也要复位，防终端残留加粗
         (get-output-stream-string out))))
 
-(defvar *md-state* :normal)
-(defun reset-md () (setf *md-state* :normal))
+;;;; repl.lisp RENDER-SECTION PATCH (surgical replacement, kept readable)
+;;;; Replaces the old global-*md-state* line renderer with one driven by the
+;;;; pure, tested agent-cl.render core. Colour helpers (*md-code-words*,
+;;;; tint-code-line, table-row-p) are preserved verbatim; the state machine and
+;;;; streaming/flush now thread fence state via *fence* (turn-scoped explicit
+;;;; value) and ask the pure core for the classification of every line.
+;;;;
+;;;; *engine* :new (default) -> fence/code-aware via agent-cl.render.
+;;;; *engine* :legacy        -> /engine legacy : passthrough ordinary lines
+;;;;                            (no fence highlighting), as a visual fallback.
 
+;;;; --- render-mode switch --------------------------------------------
+(defparameter *engine* :new)          ; :new | :legacy
+(defparameter *fence* :fence-out)     ; current agent-cl.render fence state
+
+;;;; --- colour helpers (unchanged, ANSI decisions live here) ------------
 (defvar *md-code-words*
   '("def" "return" "import" "from" "print" "if" "elif" "else" "for" "while"
     "lambda" "class" "defun" "let" "loop" "when" "unless" "setf" "progn"
@@ -214,18 +227,11 @@
   (and (plusp (length line))
        (>= (count #\| line) 2)))
 
-(defun render-md-line (line)
-  "渲染一行（不含换行）；维护代码围栏状态。"
+;;;; --- ordinary (non-fenced) inline decoration, as before -------------
+(defun render-ordinary-line (line)
+  "普通行的装饰：标题加粗 / 表格品红 / 列表或其它默认。"
   (let ((trim (string-trim '(#\Space #\Tab #\Return) line)))
     (cond
-      ((eq *md-state* :code)
-       (if (and (>= (length trim) 3) (string= (subseq trim 0 3) "```"))
-           (progn (setf *md-state* :normal)
-                  (format t "~a~%" (ansi 33 trim)))
-           (format t "~a~%" (tint-code-line line))))
-      ((and (>= (length trim) 3) (string= (subseq trim 0 3) "```"))
-       (setf *md-state* :code)
-       (format t "~a~%" (ansi 33 trim)))
       ((and (plusp (length trim)) (char= (char trim 0) #\#))
        (format t "~a~%" (render-inline (ansi 1 line))))
       ((table-row-p trim)
@@ -238,37 +244,70 @@
        (format t "~a~%" (render-inline line)))
       (t (format t "~a~%" (render-inline line))))))
 
+;;;; --- classify + emit one logical line -------------------------------
+(defun render-one-md-line (kind line)
+  "按 agent-cl.render 给的单行 KIND 上屏（不含换行）。"
+  (ecase kind
+    (:blank       (format t "~%"))
+    (:fence-start (format t "~a~%" (ansi 33 (string-trim '(#\Space #\Tab) line))))
+    (:fence-end   (format t "~a~%" (ansi 33 (string-trim '(#\Space #\Tab) line))))
+    (:code        (format t "~a~%" (tint-code-line line)))
+    (:normal      (render-ordinary-line line))))
+
+(defun advance-fence-with-line (line)
+  "将一整行(无尾换行)作为逻辑行交给 pure classify-one，更新并返回 *fence*，
+  再按分类结果上屏。legacy 模式退化为纯普通行输出。"
+  (if (eq *engine* :legacy)
+      (render-ordinary-line line)
+      (multiple-value-bind (st md)
+          (agent-cl.render:classify-one *fence* line)
+        (setf *fence* st)
+        (render-one-md-line (agent-cl.render:md-line-kind md)
+                            (agent-cl.render:md-line-text md))))
+  *fence*)
+
+;;;; --- whole-block renderer for the non-streaming fallback path ---------
 (defun render-md-text (text)
-  "整段渲染（非流式回退用）。"
-  (reset-md)
+  "整段渲染（非流式 fallback / /load 载入会话）。"
+  (setf *fence* :fence-out)
   (let ((start 0))
     (loop for nl = (position #\Newline text :start start)
           while nl
-          do (render-md-line (subseq text start nl))
-             (setf start (1+ nl)))
-    (when (< start (length text))
-      (render-md-line (subseq text start))))
-  (reset-md))
+          do (progn
+               (when (< start nl)
+                 (advance-fence-with-line (subseq text start nl)))
+               (setf start (1+ nl)))
+          finally (when (< start (length text))
+                    (advance-fence-with-line (subseq text start))))
+    (setf *fence* :fence-out)))
 
-;; 流式缓冲：整行才上色，未完成的行留缓冲
+;;;; --- streaming buffer (complete lines are flushed as they arrive) -----
 (defvar *tok-buf* (make-string-output-stream))
-(defun reset-tokens () (setf *tok-buf* (make-string-output-stream)) (reset-md))
+(defun reset-tokens ()
+  "开始一轮：清空缓冲，并把围栏状态归零（避免跨回合残留）。"
+  (setf *tok-buf* (make-string-output-stream))
+  (setf *fence* :fence-out))
 (defun flush-tokens ()
+  "回合结束：把缓冲里未成行的残片当一行处理，然后归零围栏状态。"
   (let ((rest (get-output-stream-string *tok-buf*)))
-    (when (plusp (length rest)) (render-md-line rest)))
-  (reset-md)
+    (when (plusp (length rest))
+      (advance-fence-with-line rest)))
+  (setf *fence* :fence-out)          ; 回合结束强制合拢，屏障跨回合泄漏
   (terpri)
   (finish-output))
 
 (defun repl-on-token (text)
+  "流式到达：攒到整行就渲染，未完成的行留在缓冲。"
   (write-string text *tok-buf*)
   (let ((s (get-output-stream-string *tok-buf*)))
     (loop for nl = (position #\Newline s)
           while nl
-          do (render-md-line (subseq s 0 nl))
-             (setf s (subseq s (1+ nl))))
-    (write-string s *tok-buf*)
+          do (progn
+               (advance-fence-with-line (subseq s 0 nl))
+               (setf s (subseq s (1+ nl))))
+          finally (write-string s *tok-buf*))
     (finish-output)))
+;; END REPL RENDER PATCH
 
 ;; ---------------------------------------------------------------------------
 ;; 斜杠命令面板 / 会话导出载入 / 工具可视化
@@ -429,6 +468,7 @@
   (format t "  /sessions      列出已保存会话~%")
   (format t "  /use <id>      切换到指定会话（继续之前的对话）~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
+  (format t "  /engine new|legacy  渲染引擎新/旧（旧=无代码围栏高亮）~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
   (format t "  /quit 或 /exit 退出~%"))
 
@@ -471,6 +511,14 @@
       ((string= cmd "/color")
        (setf *color* (not (and rest (string= rest "off"))))
        (format t "~&颜色: ~a~%" (if *color* "on" "off")))
+      ((string= cmd "/engine")
+       (cond
+         ((and rest (string= rest "new")) (setf *engine* :new))
+         ((and rest (string= rest "legacy")) (setf *engine* :legacy))
+         (t (format t "~&用法: /engine new|legacy；当前 ~a~%" *engine*)))
+       (when (member rest '("new" "legacy") :test #'string=)
+         (format t "~&渲染引擎: ~a~%" *engine*)))
+
       ((or (string= cmd "/quit") (string= cmd "/exit"))
        (uiop:quit 0))
       (t (format t "~&未知命令 ~a（/help 查看）~%" cmd)))))
