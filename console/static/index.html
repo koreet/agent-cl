@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh"><meta charset="utf-8">
+<title>Agent-CL Console</title>
+<style>
+:root{
+ --bg:#0f1117; --panel:#181c26; --ink:#e6e9f0; --dim:#9aa3b5; --muted:#5b6272;
+ --border:#2b3140;
+ --ubg:#0f4d6b; --uborder:#0e7cae;          /* user (you) bubble  */
+ --mbg:#232838; --mborder:#3a4256;          /* assistant / me     */
+ --codebg:#0b0f16; --code:#a9b6c6;
+ --kw:#e2b76a; --sc:#8fd39a; --nu:#8fb7e0;
+ --accent:#7fd0ff; --span:#2c3444;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+ font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+ height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{flex:0 0 auto;display:flex;gap:10px;align-items:center;padding:10px 18px;
+ background:var(--panel);border-bottom:1px solid var(--border)}
+header span{color:var(--dim);font-size:13px}
+select,input{background:var(--bg);color:var(--ink);border:1px solid var(--span);
+ border-radius:7px;padding:7px 10px;font-size:13px}
+select{max-width:220px} #find{margin-left:auto;width:230px}
+main{flex:1 1 auto;overflow-y:auto;padding:14px 20px 60px;scroll-behavior:smooth}
+.row{display:flex;margin:7px 0;flex-direction:column}
+.wrap{display:flex;align-items:flex-start}
+.bubble{max-width:80%;padding:8px 13px;border-radius:12px;white-space:pre-wrap;
+ word-break:break-word;border:1px solid}
+.you{color:var(--uborder)} .me{color:var(--mborder)} .tl{color:var(--code)}
+.you .bubble{background:var(--ubg);border-color:var(--uborder)}
+.me .bubble{background:var(--mbg);border-color:var(--mborder)}
+.tl{display:flex;justify-content:center}
+.tl .bubble{max-width:96%;background:var(--codebg);color:var(--code);
+ font:12px/1.45 ui-monospace,Consolas,Menlo,monospace;border-color:#202834;margin-top:4px}
+.who{font-size:11px;color:var(--muted);margin:1px 3px 5px 3px;align-self:flex-start}
+.tool .who{display:none}
+pre{margin:0; white-space:pre-wrap;word-break:break-word}
+code{font:12.5px ui-monospace,Consolas,Menlo,monospace}
+pre block{ display:block }
+pre code,pre .codelike{}
+pre{max-height:none;overflow:auto}
+.bubble{overflow-wrap:anywhere}
+.kw{color:var(--kw)} .sc{color:var(--sc)} .nu{color:var(--nu)}
+.ck{display:flex;justify-content:center;color:var(--muted);font-size:11px;
+ margin:14px 0 4px;gap:10px}
+.ck::before,.ck::after{content:'';flex:0 0 24px;height:1px;background:var(--span);position:relative;top:8px}
+.colb{display:inline-block;margin-left:6px;color:var(--accent);cursor:pointer;font-size:12px;user-select:none}
+.wrapCode{position:relative}
+mark{background:#a0702f;color:#fff;border-radius:3px;padding:0 1px}
+#warn{display:none;color:#e05e5e;font-size:12px;margin:0 10px}
+footer{flex:0 0 auto;display:flex;gap:8px;padding:12px 18px;background:var(--panel);
+ border-top:1px solid var(--border)}
+footer input{flex:1} #send{cursor:pointer;background:#1e5f86;border-color:transparent;color:#fff;width:auto;padding:8px 16px;font-weight:600}
+#clr{width:auto;background:transparent;border-color:var(--span);margin-right:6px;cursor:pointer}
+.muted{color:var(--dim)} #start{color:var(--muted);padding:30px;text-align:center}
+@media(max-width:720px){.bubble{max-width:92%}}
+</style>
+<body>
+<header>
+ <span>会话</span>
+ <select id="sel"></select>
+ <button id="clr" title="刷新">↻</button>
+ <input id="find" placeholder="【找你】输入关键词 → 高亮你的那条发言">
+</header>
+<main id="msgs"><div id="start">正在读取本地会话…</div></main>
+<footer>
+ <input id="inp" placeholder="对 Agent-CL 说一句(mock)…" />
+ <button id="send">发送</button>
+</footer>
+<script>
+const $=x=>document.getElementById(x);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function lex(s){                       // tiny keyword/string/number colouring
+  return esc(s)
+   .replace(/("[^"]*"|'[^']*')/g,'<span class="sc">$1</span>')
+   .replace(/\b(defun|def|let|loop|when|unless|if|else|and|or|not|progn|lambda|return|import|from|print|class|in|reduce|mapcar|format|:+|\+)\b/g,'<span class="kw">$1</span>')
+   .replace(/\b\d+(\.\d+)?\b/g,'<span class="nu">$1</span>');
+}
+function renderParts(raw){             // split prose / fenced code
+  const out=[], L=String(raw).split(/\r?\n/);
+  let prose=[], open=false, code=[];
+  const flushP=()=>{ if(prose.length){out.push('p',prose.join('\n')); prose=[];} };
+  for(const tLine of L){
+    if(/^```/.test(tLine.trim())){
+      if(!open){ flushP(); open=true; code=[]; }
+      else { out.push('c', code.join('\n')); open=false; }
+    } else if(open) code.push(tLine); else prose.push(tLine);
+  }
+  if(open) out.push('c', code.join('\n')); else flushP();
+  return out;
+}
+function renderContent(raw){
+  const p=renderParts(raw||''); let html='';
+  for(let i=0;i<p.length;i+=2){
+    if(p[i]==='c') html+='<div class="wrapCode"><pre><code>'+lex(p[i+1]||'')+'</code></pre></div>';
+    else html+= esc(p[i+1]||'').replace(/\n/g,'\n');
+  }
+  return html;
+}
+const WHO={user:'你', assistant:'Agent-CL', tool:'· 工具 ·'};
+function bubbleFor(ev){
+  const role=ev.role;
+  const row=document.createElement('div');
+  if(ev.type==='checkpoint'||role==='ck'){row.className='ck';row.textContent='· 检查点 ·';return row;}
+  row.className='row '+ (role==='tool'?'tl':role==='user'?'you':'me');
+  const w=document.createElement('div'); w.className='who'; w.textContent=WHO[role]||role;
+  const inner=document.createElement('div'); inner.className='wrap';
+  const b=document.createElement('div'); b.className='bubble'; b.innerHTML=renderContent(ev.content||'');
+  inner.appendChild(b); row.appendChild(w); row.appendChild(inner);
+  // collapsible for long code-heavy body
+  const lines=(ev.content||'').split('\n').length;
+  const pre=b.querySelector('pre');
+  if((ev.role==='assistant'&&lines>8)||ev.role==='tool'){
+    pre.style.maxHeight='180px'; pre.style.overflow='hidden';
+    const cb=document.createElement('span'); cb.className='colb'; cb.textContent='(长 '+lines+' 行 · 展开)';
+    cb.onclick=()=>{ const open= pre.style.maxHeight!=='none';
+      pre.style.maxHeight= open?'none':'180px'; pre.style.overflow= open?'auto':'hidden';
+      cb.textContent= open?'(收起)':'(长 '+lines+' 行 · 展开)'; };
+    b.appendChild(cb);
+  }
+  return row;
+}
+async function loadSessions(){
+  let ids=[]; try{ const r=await fetch('/api/sessions'); ids=await r.json(); }catch(e){}
+  $('sel').innerHTML='';
+  if(!ids.length){ $('msgs').innerHTML='<div id="start">没有读到本地会话。请在 repl 跑一次 \$ start.ps1 对话产生档，或先试 mock：下面输入发送。</div>'; return; }
+  for(const id of ids){ const o=document.createElement('option'); o.value=id; o.textContent=id; $('sel').appendChild(o);} 
+}
+async function openCurrent(){
+  const id=$('sel').value; $('msgs').innerHTML='';
+  if(!id) return;
+  let data=[]; try{ const r=await fetch('/api/session?id='+encodeURIComponent(id)); data=await r.json(); }catch(e){}
+  if(!Array.isArray(data)){ $('msgs').innerHTML='<div id="start">读取失败 '+esc(data&&data.error)+'</div>'; return; }
+  data.forEach(ev=> $('msgs').appendChild(bubbleFor(ev)));
+  $('msgs').scrollTop=$('msgs').scrollHeight;
+}
+$('sel').onchange=openCurrent;
+$('clr').onclick=async()=>{ await loadSessions(); if($('sel').value)openCurrent(); };
+// ---- find: highlight matches inside YOUR bubbles only ----
+function clearMarks(){ document.querySelectorAll('mark').forEach(m=>{ const t=document.createTextNode(m.textContent); m.parentNode.replaceChild(t,m); }); }
+function markYou(q){
+  clearMarks(); q=q.trim().toLowerCase(); if(!q)return;
+  document.querySelectorAll('.you .bubble').forEach(b=>{
+    const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT);
+    const stack=[]; let n;
+    while((n=w.nextNode())) stack.push(n);
+    for(const node of stack){
+      const low=node.nodeValue.toLowerCase(); let k=low.indexOf(q);
+      if(k<0)continue;
+      const frag=document.createDocumentFragment(); let cur=document.createTextNode(node.nodeValue); let last=0;
+      const orig=node.nodeValue;
+      while(k>=0){
+        frag.appendChild(document.createTextNode(orig.slice(last,k)));
+        const mk=document.createElement('mark'); mk.textContent=orig.slice(k,k+q.length); frag.appendChild(mk);
+        last=k+q.length; k=low.indexOf(q,last);
+      }
+      frag.appendChild(document.createTextNode(orig.slice(last)));
+      node.parentNode.replaceChild(frag,node);
+    }
+  });
+}
+$('find').addEventListener('input',()=>markYou($('find').value));
+// ---- send (mock) ----
+function fakeTs(){ return new Date().toISOString().slice(5,16).replace('T',' '); }
+async function send(){
+  const v=$('inp').value.trim(); if(!v)return; $('inp').value='';
+  const fake={'role':'user','content':v,'type':'message'};
+  $('msgs').appendChild(bubbleFor(fake)); 
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v})});
+    const d=await r.json();
+    if(d&&d.error) alert(d.error); else if(d&&d.content) $('msgs').appendChild(bubbleFor({role:'assistant',content:d.content,type:'message'}));
+  }catch(e){ alert('网络/服务错误'); }
+  $('msgs').scrollTop=$('msgs').scrollHeight;
+}
+$('send').onclick=send;
+$('inp').addEventListener('keydown',e=>{ if(e.key==='Enter')send(); });
+loadSessions();
+</script></body></html>
