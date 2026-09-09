@@ -45,7 +45,9 @@
    (:file "dsl/schema-gen")
    (:file "dsl/macros")
    ;; ---- session ----
-   (:file "session/store")))
+   (:file "session/store")
+   ;; ---- self-improvement (safe, gate-guarded single-file patches) ----
+   (:file "selfimprove/engine")))
 
 (defsystem "agent-cl/tests"
   :description "Self-contained test suite for Agent-CL (no external test framework; see docs/architecture.md adaptation note)."
@@ -60,4 +62,5 @@
    (:file "sse-tests")
    (:file "engine-tests")
    (:file "dsl-tests")
-   (:file "session-tests")))
+   (:file "session-tests")
+   (:file "selfimprove-tests")))

@@ -162,3 +162,13 @@
            #:defdsl-package #:defschema
            #:make-agent #:run #:ask #:stop #:agent
            #:*default-model* #:*default-base-url*))
+
+(defpackage #:agent-cl.selfimprove
+  (:use #:cl)
+  (:export
+   ;; safe, gate-guarded single-file self-improvement (repo docs/architecture)
+   #:improve-file
+   #:state-plist
+   #:make-git-style-backup-dir
+   ;; optional production gate: run the real repo test suite in a subprocess
+   #:real-gate-runner))
