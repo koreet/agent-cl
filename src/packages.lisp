@@ -142,7 +142,18 @@
    ;; safe evaluation (D2: disabled by default)
    #:*dsl-execution-mode* #:*dsl-command-whitelist* #:*dsl-max-steps* #:*dsl-max-result-chars*
    #:dsl-eval-safe
-   #:with-dsl-sandbox))
+   #:with-dsl-sandbox
+   ;; declaration metadata + reflection (dsl-contract-plan §B1)
+   #:dsl-declaration
+   #:decl-name #:decl-kind #:decl-spec #:decl-refs #:decl-source #:decl-version
+   #:make-declaration #:register-declaration #:find-declaration
+   #:unregister-declaration #:all-declarations #:describe-declaration
+   ;; executable goal contract (dsl-contract-plan §B2)
+   #:defgoal
+   #:goal-spec #:goal-intent #:goal-subgoals #:goal-budget
+   #:goal-preconditions #:goal-done-when-form #:goal-retry-limit
+   #:goal-done-p #:goal-preconditions-met-p
+   #:eval-local-predicate))
 
 (defpackage #:agent-cl.session
   (:use #:cl)
@@ -156,10 +167,10 @@
 (defpackage #:agent-cl
   (:use #:cl)
   (:import-from #:agent-cl.dsl #:defagent #:defpolicy #:defguard #:defdsl-tool
-                #:defcommand #:defdsl-package #:defschema)
+                #:defcommand #:defdsl-package #:defschema #:defgoal)
   (:import-from #:agent-cl.loop #:make-agent #:run #:ask #:stop #:agent)
   (:export #:defagent #:defpolicy #:defguard #:defdsl-tool #:defcommand
-           #:defdsl-package #:defschema
+           #:defdsl-package #:defschema #:defgoal
            #:make-agent #:run #:ask #:stop #:agent
            #:*default-model* #:*default-base-url*))
 
