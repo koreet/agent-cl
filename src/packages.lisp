@@ -153,7 +153,16 @@
    #:goal-spec #:goal-intent #:goal-subgoals #:goal-budget
    #:goal-preconditions #:goal-done-when-form #:goal-retry-limit
    #:goal-done-p #:goal-preconditions-met-p
-   #:eval-local-predicate))
+   #:eval-local-predicate
+   ;; executable audit rules (dsl-contract-plan milestone i)
+   #:defaudit
+   #:audit-applies-to #:audit-on-violation #:audit-evidence #:describe-audit
+   ;; principles + constitution (dsl-contract-plan milestone ii)
+   #:defprinciple
+   #:principle-priority #:principle-statement #:principle-constrains
+   #:principle-resolves-conflict-form #:all-principles
+   #:max-principle-priority #:constitution-p #:change-principle-priority
+   #:resolve-principles #:describe-principle))
 
 (defpackage #:agent-cl.session
   (:use #:cl)
@@ -167,10 +176,10 @@
 (defpackage #:agent-cl
   (:use #:cl)
   (:import-from #:agent-cl.dsl #:defagent #:defpolicy #:defguard #:defdsl-tool
-                #:defcommand #:defdsl-package #:defschema #:defgoal)
+                #:defcommand #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple)
   (:import-from #:agent-cl.loop #:make-agent #:run #:ask #:stop #:agent)
   (:export #:defagent #:defpolicy #:defguard #:defdsl-tool #:defcommand
-           #:defdsl-package #:defschema #:defgoal
+           #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple
            #:make-agent #:run #:ask #:stop #:agent
            #:*default-model* #:*default-base-url*))
 

@@ -46,6 +46,8 @@
    (:file "dsl/macros")
    (:file "dsl/meta")
    (:file "dsl/goals")
+   (:file "dsl/audit")
+   (:file "dsl/principles")
    ;; ---- session ----
    (:file "session/store")
    ;; ---- markdown line classifier (pure, fenced-code aware) ----
@@ -70,4 +72,6 @@
    (:file "session-tests")
    (:file "render-tests")
    (:file "dsl-contract-tests")
+   (:file "dsl-audit-tests")
+   (:file "dsl-principle-tests")
    (:file "selfimprove-tests")))
