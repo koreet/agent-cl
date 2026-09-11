@@ -74,4 +74,6 @@
    (:file "dsl-contract-tests")
    (:file "dsl-audit-tests")
    (:file "dsl-principle-tests")
+   (:file "dsl-audit-engine-tests")
+   (:file "dsl-goal-engine-tests")
    (:file "selfimprove-tests")))

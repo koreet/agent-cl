@@ -154,6 +154,7 @@
    #:goal-preconditions #:goal-done-when-form #:goal-retry-limit
    #:goal-done-p #:goal-preconditions-met-p
    #:eval-local-predicate
+   #:run-goal #:subgoal-task-text #:goal-completed-p   ; goal-driven execution
    ;; executable audit rules (dsl-contract-plan milestone i)
    #:defaudit
    #:audit-applies-to #:audit-on-violation #:audit-evidence #:describe-audit

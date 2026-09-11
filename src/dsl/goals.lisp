@@ -99,3 +99,54 @@
                           :spec ',spec
                           :refs ',refs
                           :source ,(or *load-pathname* *compile-file-pathname*))))))
+
+;;; --------------------------------------------------------------------------
+;;; goal-driven execution (plan milestone B)
+;;; --------------------------------------------------------------------------
+;;; RUN-GOAL walks the :subgoals by CODE (never asking the model "which step is
+;;; next?"), runs each subgoal through the engine, and after every subgoal asks
+;;; the LOCAL :done-when predicate whether the goal is reached. The moment it
+;;; holds we STOP — the model is never consulted about "am I done?" or "should I
+;;; retry?". :on-failure (retry :max N) is a local retry budget around a
+;;; subgoal. This is the concrete form of "move deterministic decisions out of
+;;; the LLM": the orchestration decisions cost zero model calls.
+
+(defun subgoal-task-text (sub)
+  "The task string handed to the engine for SUBGOAL symbol SUB."
+  (string-downcase (symbol-name sub)))
+
+(defun goal-completed-p (goal-name)
+  "Alias of GOAL-DONE-P used by RUN-GOAL (kept distinct for readability)."
+  (goal-done-p goal-name))
+
+(defun run-goal (goal-name agent &key after-subgoal)
+  "Drive AGENT through GOAL-NAME's :subgoals by code. AFTER-SUBGOAL, if given,
+  is called with each subgoal symbol after it runs (to advance world state).
+  Returns a plist:
+    :completed-p    whether a fresh goal-done-p holds at the end
+    :subgoals-run   how many subgoals were attempted (<= declared count)
+    :steps          total engine steps across all subgoal runs
+    :stopped-at     the subgoal after which we stopped (or NIL)"
+  (let* ((subs (goal-subgoals goal-name))
+         (retry-limit (goal-retry-limit goal-name))
+         (steps 0) (ran 0) (stopped-at nil) (completed nil))
+    (block walk
+      (dolist (sub subs)
+        (incf ran)
+        (let ((attempts 0))
+          (loop
+            (let ((summary (agent-cl.loop:run agent (subgoal-task-text sub))))
+              (incf steps (or (agent-cl.loop:steps summary) 0)))
+            (when after-subgoal (funcall after-subgoal sub))
+            ;; local gate: is the whole goal done now?
+            (when (goal-completed-p goal-name)
+              (setf completed t stopped-at sub)
+              (return-from walk))
+            ;; local retry policy for this subgoal
+            (incf attempts)
+            (when (>= attempts (1+ retry-limit))
+              (return))))))
+    (list :completed-p completed
+          :subgoals-run ran
+          :steps steps
+          :stopped-at stopped-at)))
