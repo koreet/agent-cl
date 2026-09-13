@@ -301,3 +301,55 @@
          (text (agent-cl.web::format-results results)))
     (is-equal nil (find (code-char 27) text) "no ESC in the rendered text")
     (ok (search "badtitle" text))))
+
+
+;;; ---------------------------------------------------------------------------
+;;; a decorative () must be optional (found by executing the README examples)
+;;; ---------------------------------------------------------------------------
+
+(deftest declaration-macros-accept-both-shapes
+  "These macros used to declare a `lambda-list` parameter, so a form written
+  WITHOUT the decorative () put its FIRST CLAUSE into that ignored parameter:
+  (defprinciple p (:priority 100) ...) registered a principle with no priority at
+  all — it silently stopped being constitutional — and
+  (defintrospect i (:based-on ((f))) ...) stored no signals."
+  (with-isolated-dsl
+    ;; with the () — the documented shape
+    (eval '(agent-cl.dsl:defprinciple shape-with () (:priority 100) (:statement "x")))
+    (is-equal 100 (agent-cl.dsl:principle-priority 'shape-with))
+    (ok (agent-cl.dsl:constitution-p 'shape-with))
+    ;; without it — previously swallowed
+    (eval '(agent-cl.dsl:defprinciple shape-without (:priority 100) (:statement "y")))
+    (is-equal 100 (agent-cl.dsl:principle-priority 'shape-without))
+    (ok (agent-cl.dsl:constitution-p 'shape-without))
+    (is-equal "x" (agent-cl.dsl:principle-statement 'shape-with))
+    (is-equal "y" (agent-cl.dsl:principle-statement 'shape-without))))
+
+(deftest introspect-identity-memory-accept-both-shapes
+  (with-isolated-dsl
+    (eval '(agent-cl.dsl:defintrospect ix-with () (:based-on ((zerop 0))) (:threshold 0.6)))
+    (eval '(agent-cl.dsl:defintrospect ix-without (:based-on ((zerop 0))) (:threshold 0.6)))
+    (dolist (name '(ix-with ix-without))
+      (is-equal '((zerop 0)) (agent-cl.dsl:introspect-signals name))
+      (is-equal 1.0 (agent-cl.dsl:introspect-confidence name))
+      (is-equal 0.6 (agent-cl.dsl:introspect-threshold name)))
+    (eval '(agent-cl.dsl:defidentity id-with () (:core-traits (:honesty 1.0))))
+    (eval '(agent-cl.dsl:defidentity id-without (:core-traits (:honesty 1.0))))
+    (dolist (name '(id-with id-without))
+      (is-equal 1.0 (agent-cl.dsl:identity-trait name :honesty)))
+    (eval '(agent-cl.dsl:defmemory mem-with () (:content "c") (:salience 0.5)))
+    (eval '(agent-cl.dsl:defmemory mem-without (:content "c") (:salience 0.5)))
+    (dolist (name '(mem-with mem-without))
+      (is-equal "c" (agent-cl.dsl:memory-content name))
+      (is-equal 0.5 (agent-cl.dsl:memory-salience name)))
+    ;; a NON-empty lambda list is still tolerated (and ignored), as documented
+    (eval '(agent-cl.dsl:defprinciple shape-odd (a b) (:priority 10)))
+    (is-equal 10 (agent-cl.dsl:principle-priority 'shape-odd))))
+
+(deftest agent-stopped-p-is-public
+  "A guard or audit rule needs to observe that the agent was stopped; STOP was
+  exported but its reader was not, so the documented predicate was unreachable."
+  (let ((agent (make-agent :transport (make-mock-transport) :tools nil)))
+    (ok (not (agent-cl.loop:agent-stopped-p agent)))
+    (agent-cl.loop:stop agent)
+    (ok (agent-cl.loop:agent-stopped-p agent))))

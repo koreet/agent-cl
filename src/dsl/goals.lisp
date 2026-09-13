@@ -109,13 +109,7 @@
       (:done-when (and (probe-tests-pass) t))
       (:on-failure (retry :max 2)))"
   (declare (ignore clauses))
-  (let ((cl (if (and (listp (first clauses)) (null (rest (first clauses))))
-                (rest clauses)          ; the conventional () lambda-list of
-                                        ; (defgoal name () ...): LISTP, not CONSP,
-                                        ; so the empty list is actually stripped
-                                        ; instead of being parsed as a clause
-                                        ; and injecting (NIL NIL) into the spec
-                clauses)))
+  (let ((cl (strip-optional-lambda-list clauses)))
     (multiple-value-bind (spec refs) (parse-goal-clauses cl)
       `(register-declaration
         (make-declaration ',name :goal

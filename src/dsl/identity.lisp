@@ -32,14 +32,14 @@
            (setf spec (append spec (list key (if (= (length val) 1) (first val) val))))))))
     (values spec refs)))
 
-(defmacro defidentity (name lambda-list &body clauses)
+(defmacro defidentity (name &body clauses)
   "Define a persistent identity (persona).
     (defidentity founder ()
       (:core-traits (:honesty 1.0) (:caution 0.7) (:curiosity 0.9))
       (:anchor \"诚实优先；不确定就说不确定\")
       (:memory-policy (:keep-failures t)))"
-  (declare (ignore lambda-list))
-  (multiple-value-bind (spec refs) (parse-identity-clauses clauses)
+  (multiple-value-bind (spec refs)
+      (parse-identity-clauses (strip-optional-lambda-list clauses))
     `(progn
        (register-declaration
         (make-declaration ',name :identity

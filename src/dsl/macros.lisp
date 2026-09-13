@@ -12,6 +12,26 @@
 (defun tool-name-string (name)
   (if (stringp name) name (string-downcase (symbol-name name))))
 
+(defun strip-optional-lambda-list (clauses)
+  "Drop the conventional empty lambda-list placeholder from CLAUSES.
+
+  Several DSL macros take the shape (defX name () clauses...). The () is
+  decorative, and treating whatever sits in that position as a lambda list meant a
+  MISSING () silently ate the FIRST CLAUSE:
+
+      (defprinciple p (:priority 100) (:statement \"x\"))
+      => priority NIL, i.e. the principle quietly stopped being constitutional
+      (defintrospect i (:based-on ((f))) ...)  => no signals at all
+
+  A clause is recognizable by its keyword head, so dispatch on that instead of
+  assuming: () -> drop, a clause -> keep, a real lambda list -> drop (and it is
+  still ignored, as documented)."
+  (let ((first (first clauses)))
+    (cond ((null first) (rest clauses))                            ; ()
+          ((and (consp first) (keywordp (first first))) clauses)   ; a clause
+          ((consp first) (rest clauses))                           ; a lambda list
+          (t clauses))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; L2: domain tool DSL
 ;;; ---------------------------------------------------------------------------

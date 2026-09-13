@@ -61,14 +61,19 @@
       (setf (decl-spec d) (plist-put (decl-spec d) :constitutional t)))
     (and d (getf (decl-spec d) :constitutional))))
 
-(defmacro defprinciple (name lambda-list &body clauses)
-  "Define a principle. LAMBDA-LIST is conventionally () (kept for symmetry).
+(defmacro defprinciple (name &body clauses)
+  "Define a principle.
     (defprinciple data-integrity ()
       (:priority 100)
       (:statement \"用户数据的完整性优先于任务完成速度\")
-      (:constrains workspace-write))"
-  (declare (ignore lambda-list))
-  (multiple-value-bind (spec refs) (parse-principle-clauses clauses)
+      (:constrains workspace-write))
+
+  The conventional empty () after NAME is accepted (it is stripped), but it is
+  OPTIONAL: omitting it used to place the first clause into an ignored
+  lambda-list parameter, so (:priority 100) vanished and the principle silently
+  stopped being constitutional."
+  (multiple-value-bind (spec refs)
+      (parse-principle-clauses (strip-optional-lambda-list clauses))
     `(progn
        (register-declaration
         (make-declaration ',name :principle

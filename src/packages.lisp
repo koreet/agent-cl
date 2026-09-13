@@ -129,6 +129,9 @@
    #:agent-usage-prompt #:agent-usage-completion
     #:agent-cache-hit #:agent-cache-miss #:agent-cache-seen
     #:agent-depth
+    ;; a guard/audit rule legitimately needs to observe "the agent was stopped";
+    ;; the writer STOP is exported but this reader was not
+    #:agent-stopped-p
    #:policy
    #:make-policy #:policy-max-steps #:policy-temperature #:policy-max-tool-results
    #:policy-parallel-tools #:policy-allow-model-retry #:policy-max-tokens

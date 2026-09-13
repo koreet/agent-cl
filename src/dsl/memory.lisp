@@ -28,15 +28,15 @@
           (otherwise (setf spec (append spec (list key (if (= (length val) 1) (first val) val))))))))
     (values spec refs)))
 
-(defmacro defmemory (name lambda-list &body clauses)
+(defmacro defmemory (name &body clauses)
   "Define a lifecycle memory entry.
     (defmemory failed-migration-42 ()
       (:content \"last auth migration broke on a boundary case\")
       (:salience 0.8)
       (:linked-to refactor-auth)
       (:recall-when (goal-active-p 'refactor-auth)))"
-  (declare (ignore lambda-list))
-  (multiple-value-bind (spec refs) (parse-memory-clauses clauses)
+  (multiple-value-bind (spec refs)
+      (parse-memory-clauses (strip-optional-lambda-list clauses))
     `(progn
        (register-declaration
         (make-declaration ',name :memory

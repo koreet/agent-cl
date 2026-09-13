@@ -46,15 +46,15 @@
           (otherwise (setf spec (append spec (list key (if (= (length val) 1) (first val) val))))))))
     (values spec refs)))
 
-(defmacro defintrospect (name lambda-list &body clauses)
+(defmacro defintrospect (name &body clauses)
   "Define a metacognition rule.
     (defintrospect auth-rework ()
       (:based-on ((has-relevant-file-p) (last-test-passed-p)))
       (:threshold 0.6)
       (:on-low :ask-clarifying-question)
       (:failure-patterns ((:kind :missing-context :when (no-relevant-file-p)))))"
-  (declare (ignore lambda-list))
-  (multiple-value-bind (spec refs) (parse-introspect-clauses clauses)
+  (multiple-value-bind (spec refs)
+      (parse-introspect-clauses (strip-optional-lambda-list clauses))
     `(progn
        (register-declaration
         (make-declaration ',name :introspect
