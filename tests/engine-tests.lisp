@@ -476,6 +476,52 @@
 ;;; task.delegate: parent delegates to an independent child session
 ;;; ---------------------------------------------------------------------------
 
+(deftest file-tools-refuse-dotdot-traversal
+  "A relative path that climbs out with '..' must be refused. Verified against
+  the real machine before the fix: '../../../../Windows/win.ini' was READABLE,
+  because only the literal string was prefix-checked, never the folded path."
+  (register-builtin-tools)
+  (let ((saved agent-cl.tools:*file-workspace-root*))
+    (unwind-protect
+         (progn
+           (agent-cl.tools:set-file-workspace-root (uiop:getcwd))
+           (dolist (evil '("../../../../Windows/win.ini"
+                           "../escape.txt"
+                           "docs/../../../../Windows/win.ini"
+                           "..\\..\\Windows\\win.ini"))
+             (multiple-value-bind (c s)
+                 (agent-cl.tools:call-tool "file.read" (list :PATH evil))
+               (is-equal :error s (format nil "~a must be refused" evil))
+               (ok (search "工作区外" c)))
+             (multiple-value-bind (c s)
+                 (agent-cl.tools:call-tool
+                  "file.write" (list :PATH evil :CONTENT "pwned"))
+               (is-equal :error s (format nil "writing ~a must be refused" evil))))
+           ;; '..' that stays inside the workspace is still fine
+           (multiple-value-bind (c s)
+               (agent-cl.tools:call-tool "file.read" (list :PATH "src/../README.md"))
+             (is-equal :ok s)
+             (ok (plusp (length c)))
+             (ok (search "agent-cl" c))))
+      (setf agent-cl.tools:*file-workspace-root* saved)))
+  (dolist (n '("file.read" "file.write")) (unregister-tool n)))
+
+(deftest path-helpers-fold-and-bound
+  "The canonicalizers shared by the file tools and self-improvement: '..' is
+  folded lexically, and containment is by path segment, not by string prefix."
+  (let ((root (agent-cl.core:canonical-path-string (uiop:getcwd))))
+    (ok (agent-cl.core:path-inside-p
+         (agent-cl.core:canonical-path-string "a/b/../c" root) root)
+        "folded '..' stays inside")
+    (ok (not (agent-cl.core:path-inside-p
+              (agent-cl.core:canonical-path-string "../../x" root) root))
+        "climbing out is outside")
+    ;; sibling with a shared string prefix must NOT count as inside
+    (ok (not (agent-cl.core:path-inside-p "C:/repo-extra/x" "C:/repo"))
+        "string-prefix siblings are not descendants")
+    (ok (agent-cl.core:path-inside-p "C:/repo/x" "C:/repo"))
+    (ok (agent-cl.core:path-inside-p "C:/repo" "C:/repo") "the root is inside itself")))
+
 (deftest delegate-child-returns-conclusion-only
   "Child runs a separate short session; only its conclusion lands in the
   parent transcript (token saver)."
@@ -519,13 +565,59 @@
                        (script-reply (reply-json "" (list (tc-json "c2" "test.square" "{\"x\":6}"))))
                        (script-reply (reply-json "36" nil))
                        (script-reply (reply-json "子agent 报告结果是 36" nil)))))
-         (agent (make-agent :transport tr :tools '("task.delegate")
+         ;; the parent must itself hold test.square: a child can only be given
+         ;; tools the parent already has (see delegate-cannot-grant-...)
+         (agent (make-agent :transport tr :tools '("task.delegate" "test.square")
                             :policy (make-policy :max-steps 6)))
          (summary (run agent "派个子 agent 帮我算 6 的平方")))
     (ok (done-p summary))
     (ok (search "36" (final-content summary))))
   (unregister-tool "task.delegate")
   (unregister-tool "test.square"))
+
+(deftest delegate-cannot-grant-tools-the-parent-lacks
+  "A restricted parent (only time.now) must not be able to hand a child
+  shell.run: tool escalation through delegation would otherwise bypass the
+  parent's own tool restriction."
+  (agent-cl.tools:register-builtin-tools)
+  (let ((parent (make-agent :transport (make-mock-transport)
+                            :tools '("time.now"))))
+    (is-equal nil (agent-cl.tools::resolve-child-tools parent '("shell.run")))
+    (is-equal nil (agent-cl.tools::resolve-child-tools parent '("file.write")))
+    (is-equal '("time.now")
+              (agent-cl.tools::resolve-child-tools parent '("time.now")))
+    ;; no explicit list -> inherit exactly what the parent may use
+    (is-equal '("time.now") (agent-cl.tools::resolve-child-tools parent nil)))
+  (dolist (n '("shell.run" "file.write" "time.now")) (unregister-tool n)))
+
+(deftest delegate-synonym-names-cannot-smuggle-delegation
+  "TOOLS entries are resolved through the registry, which maps wire names back to
+  DSL names — so 'task:delegate', 'task/delegate', 'task delegate' and
+  'task_delegate' all denote the delegation tool and must all be filtered out.
+  A literal string comparison against 'task.delegate' missed every one of them."
+  (agent-cl.tools:register-builtin-tools)
+  (let ((parent (make-agent :transport (make-mock-transport) :tools :all)))
+    (dolist (alias '("task.delegate" "task:delegate" "task/delegate"
+                     "task delegate" "task_delegate" "TASK.DELEGATE"))
+      (is-equal nil (agent-cl.tools::resolve-child-tools parent (list alias))
+                (format nil "~s must not reach the child" alias)))
+    ;; a genuine tool alongside a smuggled one survives
+    (is-equal '("time.now")
+              (agent-cl.tools::resolve-child-tools
+               parent '("task:delegate" "time.now"))))
+  (dolist (n '("task.delegate" "time.now")) (unregister-tool n)))
+
+(deftest delegate-refuses-past-the-depth-limit
+  "Depth is capped, so a smuggled delegation tool still cannot recurse forever."
+  (agent-cl.tools:register-builtin-tools)
+  (let ((deep (make-agent :transport (make-mock-transport)
+                          :tools :all
+                          :depth agent-cl.tools::*max-delegate-depth*)))
+    (multiple-value-bind (c s)
+        (agent-cl.tools:call-tool "task.delegate" (list :TASK "再派一个") deep)
+      (is-equal :error s)
+      (ok (search "委派层级" c))))
+  (dolist (n '("task.delegate")) (unregister-tool n)))
 
 (deftest delegate-rejects-nesting-by-default
   (agent-cl.tools:register-builtin-tools)

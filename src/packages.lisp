@@ -41,6 +41,9 @@
    #:shell-command
    #:read-file-lenient
    #:run-program-with-timeout
+   #:path-segments
+   #:canonical-path-string
+   #:path-inside-p
    #:format-token-count))
 
 (defpackage #:agent-cl.messages

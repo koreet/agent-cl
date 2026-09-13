@@ -145,9 +145,30 @@
                :required (getf spec :required)
                :items (getf spec :items)))
 
+(defun numeric-literal-chars-p (string)
+  "True when STRING consists only of characters that may occur in a numeric
+  literal. This is a *safety* check, not a parser: by rejecting every other
+  character we guarantee READ-FROM-STRING can never reach a reader macro, so
+  model-supplied text such as \"#.(delete-file ...)\" stays inert."
+  (and (stringp string)
+       (plusp (length string))
+       (every (lambda (c)
+                (or (digit-char-p c)
+                    (find c "+-.eEdDfFlLsS")))
+              string)))
+
 (defun read-number (string)
-  (let ((*read-default-float-format* 'double-float))
-    (read-from-string string nil nil)))
+  "Parse STRING as a number, or NIL when it is not a plain numeric literal.
+  READ-EVAL is bound to NIL in addition to the character whitelist (defence in
+  depth), and trailing junk is rejected rather than silently truncated."
+  (when (numeric-literal-chars-p string)
+    (let ((*read-default-float-format* 'double-float)
+          (*read-eval* nil))
+      (multiple-value-bind (value pos)
+          (handler-case (read-from-string string nil nil)
+            (error () (values nil 0)))
+        (when (and (numberp value) (eql pos (length string)))
+          value)))))
 
 (defmethod validate-value (spec value path problems)
   "Validate VALUE (already decoded to plists/keywords) against property spec."
@@ -231,7 +252,9 @@
   (labels ((coerce-value (spec v)
              (let ((type (or (getf spec :type) :string)))
                (cond ((and (eq type :number) (stringp v))
-                      (handler-case (read-number v) (error () v)))
+                      ;; a failed parse keeps the original string so the
+                      ;; validator reports it instead of seeing a bogus NIL
+                      (or (read-number v) v))
                      ((and (eq type :integer) (stringp v))
                       (handler-case (parse-integer v) (error () v)))
                      (t v)))))

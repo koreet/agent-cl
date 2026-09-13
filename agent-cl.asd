@@ -72,6 +72,7 @@
   ((:file "harness")
    (:file "core-tests")
    (:file "codec-tests")
+   (:file "schema-tests")
    (:file "sse-tests")
    (:file "engine-tests")
    (:file "dsl-tests")

@@ -52,6 +52,77 @@
    (merge-pathnames "_improve-backups/" (uiop:getcwd))))
 
 ;; ---------------------------------------------------------------------------
+;; repo location, path confinement, and the real production gate runner
+;; ---------------------------------------------------------------------------
+
+(defun directory-holds-file-p (dir name)
+  (let ((p (ignore-errors
+            (probe-file (uiop:subpathname (uiop:ensure-directory-pathname dir)
+                                          name)))))
+    (and p t)))
+
+(defun repo-root-path ()
+  "Repository root: the nearest ancestor directory holding agent-cl.asd. Derived
+  from the ASDF system location first (correct even when this file was loaded
+  from a compiled fasl), then by walking up from *LOAD-TRUENAME*, then from the
+  cwd. Never hard-codes an absolute path."
+  (labels ((walk (start)
+             (when start
+               (loop for dir = (ignore-errors (uiop:ensure-directory-pathname start))
+                       then (ignore-errors
+                             (uiop:pathname-parent-directory-pathname dir))
+                     for guard from 0 below 16
+                     while dir
+                     when (directory-holds-file-p dir "agent-cl.asd") return dir
+                     when (equal dir (ignore-errors
+                                      (uiop:pathname-parent-directory-pathname dir)))
+                       return nil))))
+    (let ((asdf-dir
+            (let ((pkg (find-package "ASDF")))
+              (when pkg
+                (let ((fn (find-symbol "SYSTEM-SOURCE-DIRECTORY" pkg)))
+                  (when (and fn (fboundp fn))
+                    (ignore-errors (funcall fn :agent-cl))))))))
+      (or (walk asdf-dir)
+          (walk *load-truename*)
+          (walk (uiop:getcwd))
+          (uiop:getcwd)))))
+
+(defparameter *protected-paths*
+  '("scripts/run-tests.lisp" "tests/" "agent-cl.asd")
+  "Repo-relative paths (or directory prefixes, trailing /) that IMPROVE-FILE
+  refuses to patch: they *define* the gate, so letting a patch edit them would
+  make the gate meaningless.")
+
+(defun repo-relative (path &key (root (repo-root-path)))
+  "Return PATH made relative to ROOT when it is inside it, else NIL. Both sides
+  are canonicalised lexically first, so '..' cannot smuggle a path out."
+  (let* ((canon-root (agent-cl.core:canonical-path-string root))
+         (canon (agent-cl.core:canonical-path-string path canon-root)))
+    (when (agent-cl.core:path-inside-p canon canon-root)
+      (let ((prefix (if (char= (char canon-root (1- (length canon-root))) #\/)
+                        canon-root
+                        (concatenate 'string canon-root "/"))))
+        (subseq canon (length prefix))))))
+
+(defun path-confinement-error (path)
+  "Reason string when IMPROVE-FILE must refuse PATH, else NIL. Confined to the
+  repository: this primitive rewrites files and runs a gate on the result, so an
+  unrestricted path would let a patch touch any file on the machine."
+  (let ((rel (repo-relative path)))
+    (cond
+      ((null rel)
+       (format nil "拒绝修改仓库外的文件 ~a（允许范围 ~a）" path (repo-root-path)))
+      ((some (lambda (p)
+               (if (char= (char p (1- (length p))) #\/)
+                   (and (>= (length rel) (length p))
+                        (string= rel p :end1 (length p) :end2 (length p)))
+                   (string-equal rel p)))
+             *protected-paths*)
+       (format nil "拒绝修改受保护的测试/门禁文件 ~a（它们定义了 gate 本身）" rel))
+      (t nil))))
+
+;; ---------------------------------------------------------------------------
 ;; main primitive
 ;; ---------------------------------------------------------------------------
 
@@ -60,8 +131,9 @@
   "Propose NEW-CONTENT for source file PATH, gated by TEST-RUNNER.
 
   Contract (strict / safe):
-   1. Validate PATH is readable and NEW-CONTENT is non-empty and differs from
-      the file's current content. If identical -> (:status :no-change).
+   1. Validate PATH is readable, inside the repository (see
+      PATH-CONFINEMENT-ERROR), and NEW-CONTENT is non-empty and differs from the
+      file's current content. If identical -> (:status :no-change).
    2. Backup: write the *old* content verbatim to BACKUP-DIR before patching.
    3. Patch: write NEW-CONTENT to PATH.
    4. Gate: call (TEST-RUNNER), which returns (values OKP DETAIL).
@@ -70,70 +142,68 @@
                     (:status :rolled-back :detail DETAIL).
    5. By default (KEEP-BACKUP-ON-PASS nil) the backup is deleted on adopt.
 
+  Every failure path returns (:status :rejected ...) instead of signalling; the
+  caller may pass non-string NEW-CONTENT and still get a state plist back.
+
   TEST-RUNNER runs once while the patched file is live on disk, so a real
   runner can load/re-test that exact content."
-  (check-type new-content string)
   (handler-case
-      (let* ((pathname (or (ignore-errors (pathname path))
-                           (return-from improve-file
-                             (state-plist :status :rejected
-                                          :detail "could not parse path"))))
-             (old-content (agent-cl.core:read-file-string pathname))
-             (bk-dir (uiop:ensure-directory-pathname
-                      (or backup-dir (make-git-style-backup-dir))))
-             (clean-new (string-trim '(#\Newline #\Return #\Space)
-                                     new-content)))
-        (ensure-directories-exist bk-dir)
-        (cond
-          ((null old-content)
-           (state-plist :status :rejected
-                        :detail "path unreadable or absent"))
-          ((string= clean-new "")
-           (state-plist :status :rejected :detail "empty new content"))
-          ((string= old-content new-content)
-           (state-plist :status :no-change))
-          (t
-           (let ((bak (uiop:subpathname bk-dir (backup-filename pathname))))
-             ;; 1 backup old content
-             (agent-cl.core:write-file-string bak old-content)
-             (format t "~&[selfimprove] backup   ~a~%" (namestring bak))
-             ;; 2 patch
-             (agent-cl.core:write-file-string pathname new-content
-                                              :if-exists :supersede)
-             ;; 3 gate — if TEST-RUNNER RAISES (rather than returning) it is still
-             ;;       a FAILED gate: we must roll back, never leave a half-applied
-             ;;       patch. Errors from prior steps (backup/write) still fall
-             ;;       through to the outer handler as :rejected.
-             (multiple-value-bind (okp detail)
-                 (handler-case (funcall test-runner)
-                   (error (e) (values nil (format nil "gate raised: ~a" e))))
-               (cond
-                 (okp
-                  (unless keep-backup-on-pass
-                    (when (probe-file bak) (delete-file bak)))
-                  (state-plist :status :adopted
-                               :detail (or detail "gate passed")))
-                 (t
-                  ;; 4 rollback from backup
-                  (agent-cl.core:write-file-string pathname old-content
-                                                   :if-exists :supersede)
-                  (when (probe-file bak) (delete-file bak))
-                  (state-plist :status :rolled-back
-                               :detail (or detail "gate failed")))))))))
+      (progn
+        (check-type new-content string)
+        (let* ((pathname (or (ignore-errors (pathname path))
+                             (return-from improve-file
+                               (state-plist :status :rejected
+                                            :detail "could not parse path"))))
+               (refusal (path-confinement-error pathname)))
+          ;; Refuse BEFORE touching the filesystem. Checking confinement as just
+          ;; another COND clause used to read the file first, and a missing file
+          ;; raised there — masking the real reason with an OS error.
+          (if refusal
+              (state-plist :status :rejected :detail refusal)
+              (let* ((old-content (agent-cl.core:read-file-string pathname))
+                     (bk-dir (uiop:ensure-directory-pathname
+                              (or backup-dir (make-git-style-backup-dir))))
+                     (clean-new (string-trim '(#\Newline #\Return #\Space)
+                                             new-content)))
+                (ensure-directories-exist bk-dir)
+                (cond
+                  ((null old-content)
+                   (state-plist :status :rejected
+                                :detail "path unreadable or absent"))
+                  ((string= clean-new "")
+                   (state-plist :status :rejected :detail "empty new content"))
+                  ((string= old-content new-content)
+                   (state-plist :status :no-change))
+                  (t
+                   (let ((bak (uiop:subpathname bk-dir (backup-filename pathname))))
+                     ;; 1 backup old content
+                     (agent-cl.core:write-file-string bak old-content)
+                     (format t "~&[selfimprove] backup   ~a~%" (namestring bak))
+                     ;; 2 patch
+                     (agent-cl.core:write-file-string pathname new-content
+                                                      :if-exists :supersede)
+                     ;; 3 gate — if TEST-RUNNER RAISES (rather than returning) it is
+                     ;;       still a FAILED gate: we must roll back, never leave a
+                     ;;       half-applied patch. Errors from prior steps (backup/
+                     ;;       write) still fall through to the outer handler.
+                     (multiple-value-bind (okp detail)
+                         (handler-case (funcall test-runner)
+                           (error (e) (values nil (format nil "gate raised: ~a" e))))
+                       (cond
+                         (okp
+                          (unless keep-backup-on-pass
+                            (when (probe-file bak) (delete-file bak)))
+                          (state-plist :status :adopted
+                                       :detail (or detail "gate passed")))
+                         (t
+                          ;; 4 rollback from backup
+                          (agent-cl.core:write-file-string pathname old-content
+                                                           :if-exists :supersede)
+                          (when (probe-file bak) (delete-file bak))
+                          (state-plist :status :rolled-back
+                                       :detail (or detail "gate failed"))))))))))))
     (error (e)
       (state-plist :status :rejected :detail (format nil "~a" e)))))
-;; ---------------------------------------------------------------------------
-;; real production gate runner (adopted via improve-file self-edit)
-;; ---------------------------------------------------------------------------
-
-(defun repo-root-path ()
-  "Repository root: the directory containing scripts/run-tests.lisp. Derived
-  from the location of this source file so no absolute path is hard-coded."
-  (uiop:ensure-directory-pathname
-   (uiop:pathname-parent-directory-pathname
-    (uiop:pathname-directory-pathname
-     (or *load-pathname*
-         (uiop:getcwd))))))
 
 (defun find-sbcl-exec ()
   "Return a pathname of an sbcl executable, or NIL. Lookup order: the
@@ -158,12 +228,16 @@
          (m (min n (length txt))))
     (subseq txt (- (length txt) m))))
 
-(defun real-gate-runner (&key (root nil))
+(defun real-gate-runner (&key (root nil) (timeout 900))
   "Run the real repository test suite (scripts/run-tests.lisp) in a fresh
   subprocess as the gate for IMPROVE-FILE. Returns (values OKP DETAIL); OKP is
   T only when the suite exits 0 and reports '0 failed'. Safe to pass as
   TEST-RUNNER: any compile/load error in the patched file makes the subprocess
-  fail, so a bad patch is seen and rolled back."
+  fail, so a bad patch is seen and rolled back.
+
+  The run is bounded by TIMEOUT seconds through AGENT-CL.CORE:RUN-PROGRAM-WITH-
+  TIMEOUT. UIOP's own :TIMEOUT is a no-op on Windows, and an unbounded gate would
+  otherwise hang the whole agent on a patched file that deadlocks the suite."
   (let* ((repo (uiop:ensure-directory-pathname (or root (repo-root-path))))
          (run-tests (probe-file (uiop:subpathname repo "scripts/run-tests.lisp")))
          (sbcl (find-sbcl-exec)))
@@ -172,13 +246,17 @@
       ((null sbcl)      (values nil "no sbcl executable found"))
       (t
        (multiple-value-bind (out err exit)
-           (uiop:run-program (list (namestring sbcl) "--script"
-                                   (namestring run-tests))
-                             :output :string :error-output :string
-                             :directory (namestring repo)
-                             :ignore-error-status t)
+           (agent-cl.core:run-program-with-timeout
+            (list (namestring sbcl) "--script" (namestring run-tests))
+            :timeout timeout
+            :directory repo)
          (declare (ignore err))
          (let ((txt (or out "")))
            (values (and (integerp exit) (zerop exit)
                         (not (null (search "0 failed" txt))))
-                   (format nil "exit=~a tail=[~a]" exit (tail-string txt 400)))))))))
+                   (format nil "exit=~a (~a) tail=[~a]"
+                           exit
+                           (if (eq exit :timeout)
+                               (format nil "超时 ~as 后终止" timeout)
+                               "完成")
+                           (tail-string txt 400)))))))))

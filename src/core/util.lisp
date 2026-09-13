@@ -78,7 +78,12 @@
                       (t 4)))))
 
 (defun read-file-string (path &key (external-format :utf-8))
-  (uiop:read-file-string path :external-format external-format))
+  "Read PATH as text, or NIL when it does not exist. An absent file is an
+  ordinary outcome here rather than a condition — callers such as
+  SELFIMPROVE:IMPROVE-FILE distinguish it explicitly, and letting OPEN signal
+  used to mask the real reason behind an OS error message."
+  (when (uiop:file-exists-p path)
+    (uiop:read-file-string path :external-format external-format)))
 
 (defun write-file-string (path content &key (external-format :utf-8)
                                             (if-exists :supersede)
@@ -208,6 +213,59 @@
               (ignore-errors (uiop:terminate-process proc)))
             (ignore-errors (delete-file out-file))
             (ignore-errors (delete-file err-file))))))))
+
+;; ---------------------------------------------------------------------------
+;; lexical path handling — one implementation, shared by the file tools
+;; (workspace confinement) and self-improvement (repo confinement)
+;; ---------------------------------------------------------------------------
+
+(defun path-segments (absolute-string)
+  "Split an ABSOLUTE-STRING path into (values PREFIX SEGMENTS). '.' is dropped
+  and '..' pops the previous segment, so the result is already folded. Purely
+  lexical: the filesystem is never touched, which is what makes it usable for
+  files that do not exist yet. PREFIX is the Windows drive (\"C:\") or \"\"."
+  (let* ((s (substitute #\/ #\\ (princ-to-string absolute-string)))
+         (prefix "")
+         (rest s))
+    (when (and (>= (length s) 2)
+               (alpha-char-p (char s 0))
+               (char= (char s 1) #\:))
+      (setf prefix (subseq s 0 2)
+            rest (subseq s 2)))
+    (let ((out nil))
+      (dolist (seg (uiop:split-string rest :separator '(#\/)))
+        (cond ((or (string= seg "") (string= seg ".")) nil)
+              ;; '..' pops the previous segment; above the root it is ignored
+              ((string= seg "..") (when out (pop out)))
+              (t (push seg out))))
+      (values prefix (nreverse out)))))
+
+(defun canonical-path-string (path &optional base)
+  "Lexically canonical absolute path string for PATH, with '..' folded away.
+  Relative paths resolve against BASE, falling back to the current working
+  directory. Because folding happens before the string is used, callers can
+  validate this exact string and then OPEN it: what was checked is what is used."
+  (let* ((raw (if (pathnamep path) (namestring path) (princ-to-string path)))
+         (abs (if (uiop:absolute-pathname-p (pathname raw))
+                  raw
+                  (namestring (merge-pathnames
+                               raw
+                               (uiop:ensure-directory-pathname
+                                (or base (uiop:getcwd))))))))
+    (multiple-value-bind (prefix segs) (path-segments abs)
+      (if segs
+          (format nil "~a/~{~a~^/~}" prefix segs)
+          (format nil "~a/" prefix)))))
+
+(defun path-inside-p (candidate root)
+  "True when canonical CANDIDATE equals or sits under canonical ROOT. Case is
+  folded only on Windows, where the filesystem is case-insensitive."
+  (let ((c (if (uiop:os-windows-p) (string-downcase candidate) candidate))
+        (r (if (uiop:os-windows-p) (string-downcase root) root)))
+    (or (string= c r)
+        (and (> (length c) (length r))
+             (string= c r :end1 (length r) :end2 (length r))
+             (char= (char c (length r)) #\/)))))
 
 (defun format-token-count (n)
   "Compact token count for display: <1000 as-is, then 1.2k, then 1.2M.

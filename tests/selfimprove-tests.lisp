@@ -100,3 +100,65 @@
     (when (probe-file bkdir)
       (dolist (f (directory bkdir)) (ignore-errors (delete-file f)))))
   (ignore-errors (delete-file ".tools/si-test-target.txt")))
+
+
+;; --- confinement: the primitive must not rewrite files outside the repo -------
+(deftest selfimprove-refuses-paths-outside-the-repo
+  "IMPROVE-FILE rewrites a file and then gates the result, so an unrestricted
+  path would let a patch touch anything on the machine (C:\\Windows, ~/.ssh)."
+  (dolist (evil (list "../../../../Windows/win.ini"
+                      "../outside.txt"
+                      "C:/Windows/win.ini"))
+    (let ((res (agent-cl.selfimprove:improve-file
+                evil "PWNED" (lambda () (values t "ok")))))
+      (is-equal :rejected (getf res :status) (format nil "~a must be refused" evil))
+      (ok (search "仓库外" (or (getf res :detail) ""))
+          "the refusal should say it is outside the repository")))
+  ;; and no stray file was created next to the attempted target
+  (is-equal nil (probe-file "../outside.txt")))
+
+(deftest selfimprove-refuses-to-patch-the-gate-itself
+  "scripts/run-tests.lisp, tests/ and agent-cl.asd define the gate; a patch that
+  edits them would make the gate meaningless (a two-step bypass)."
+  (dolist (guarded '("scripts/run-tests.lisp"
+                     "tests/selfimprove-tests.lisp"
+                     "agent-cl.asd"))
+    (let ((before (read-file-string guarded))
+          (res (agent-cl.selfimprove:improve-file
+                guarded ";;;; pwned" (lambda () (values t "ok")))))
+      (is-equal :rejected (getf res :status)
+                (format nil "~a must be protected" guarded))
+      (ok (search "受保护" (or (getf res :detail) "")))
+      ;; the real file is intact
+      (is-equal before (read-file-string guarded)
+                (format nil "~a must be unchanged" guarded)))))
+
+(deftest selfimprove-rejects-non-string-content-without-signalling
+  "CHECK-TYPE used to sit OUTSIDE the handler-case, so a bad argument signalled
+  instead of returning the documented state plist."
+  (let ((res (agent-cl.selfimprove:improve-file
+              *si-test-file* 42 (lambda () (values t "ok")))))
+    (is-equal :rejected (getf res :status))
+    (ok (getf res :detail))))
+
+(deftest selfimprove-repo-root-is-the-actual-repo
+  "REPO-ROOT-PATH used to walk up only one level (src/ instead of the repo root,
+  and the fasl cache dir under ASDF), so the real gate would never find
+  scripts/run-tests.lisp. It must now locate agent-cl.asd."
+  (let ((root (agent-cl.selfimprove::repo-root-path)))
+    (ok (probe-file (uiop:subpathname root "agent-cl.asd"))
+        (format nil "~a should hold agent-cl.asd" root))
+    (ok (probe-file (uiop:subpathname root "scripts/run-tests.lisp"))
+        "the gate script must be reachable from the repo root")))
+
+(deftest selfimprove-confinement-works-inside-the-repo
+  "The confinement must not break the normal case: a path inside the repo (the
+  throwaway .tools/ target used by these tests) is accepted."
+  (write-si-old)
+  (is-equal ".tools/si-test-target.txt"
+            (agent-cl.selfimprove::repo-relative *si-test-file*))
+  (let ((res (agent-cl.selfimprove:improve-file
+              *si-test-file* "CONFINED-OK" (lambda () (values t "ok")))))
+    (is-equal :adopted (getf res :status))
+    (is-equal "CONFINED-OK" (read-si)))
+  (ignore-errors (delete-file ".tools/si-test-target.txt")))
