@@ -14,7 +14,7 @@
   :description "A modern agent in Common Lisp: OpenAI-compatible tool-calling loop, builtin tools, streaming, structured output and Lisp-macro DSL customization."
   :version "0.1.0"
   :author "agent-cl contributors"
-  :license "MIT"
+  :license "Apache-2.0"
   :depends-on ("alexandria" "yason" "split-sequence" "bordeaux-threads")
   :serial t
   :pathname "src/"

@@ -126,7 +126,7 @@
 
   Ids are synthesized (process-wide, so they cannot collide across turns) when
   the provider omits them, and a call with NO function name is dropped: recording
-  it produced an "unknown tool NIL" result and replayed `"name":null` to the
+  it produced an unknown-tool result and replayed a null function name to the
   provider on every later request of the session, which strict endpoints reject."
   (loop for tc in wire-tool-calls
         for fn = (getf tc :FUNCTION)
