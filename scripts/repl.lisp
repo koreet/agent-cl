@@ -598,6 +598,7 @@
   (format t "  /use [编号|id|前缀]  切换会话；不带参数则交互选择~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
   (format t "  /usage         显示模型 / token 用量 / 工作路径~%")
+  (format t "  /model [名称]  从 API 拉取模型列表并选择；带名称则直接切换~%")
   (format t "  /demo          markdown 渲染 + 状态栏自检~%")
   (format t "  /engine new|legacy  渲染引擎新/旧（旧=无代码围栏高亮）~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
@@ -659,6 +660,10 @@
                (agent-cl.loop:agent-usage-completion agent)
                (agent-cl.loop:agent-usage-total agent)
                (current-workdir)))
+      ((string= cmd "/model")
+       (if (and rest (plusp (length rest)))
+           (repl-set-model agent rest)
+           (repl-choose-model agent)))
       ((string= cmd "/demo")
        (format t "~&── markdown 渲染自检（引擎: ~a）──~%" *engine*)
        (dolist (l '("# 一级标题"
@@ -704,6 +709,66 @@
              (string-equal home (subseq cwd 0 (length home))))
         (concatenate 'string "~" (subseq cwd (length home)))
         cwd)))
+
+(defun fetch-model-ids ()
+  "GET <base-url>/models and return the list of model ids, or NIL on any
+  failure (no key, offline, package missing). Uses dexador if available."
+  (handler-case
+      (let ((get (find-symbol "GET" "DEXADOR"))
+            (key (uiop:getenv "AGENT_CL_API_KEY")))
+        (when get
+          (let* ((url (concatenate 'string
+                                   (string-right-trim "/" *base-url*) "/models"))
+                 (body (funcall get url
+                                :headers (list (cons "Authorization"
+                                                     (concatenate 'string "Bearer " key)))
+                                :read-timeout 30)))
+            (agent-cl.llm:parse-models-response body))))
+    (error (e) (format t "~&[model] 拉取失败: ~a~%" e) nil)))
+
+(defun repl-choose-model (agent)
+  "Interactive model picker: fetch ids, list them, set agent-model on choice.
+  Keeps the conversation history; only the model name changes."
+  (let ((ids (fetch-model-ids)))
+    (cond
+      ((null ids)
+       (format t "~&[model] 无法获取模型列表（离线或未配置 key）。可用 /model <名称> 直接指定。~%"))
+      (t
+       (format t "~&可用模型（共 ~a 个，当前 ~a）：~%" (length ids)
+               (agent-cl.loop:agent-model agent))
+       (loop for id in ids for i from 1
+             do (format t "  ~2d) ~a~a~%" i id
+                        (if (string= id (agent-cl.loop:agent-model agent))
+                            "  ← 当前" "")))
+       (format t "选择模型编号（直接回车取消）: ")
+       (finish-output)
+       (let* ((line (read-line *standard-input* nil :eof))
+              (line (if (eq line :eof) "" (string-trim '(#\Space #\Tab) line))))
+         (multiple-value-bind (id status)
+             (agent-cl.session:resolve-session-choice line ids)
+           (case status
+             (:ok (set-model agent id))
+             (:none (format t "~&[model] 已取消。~%"))
+             (:ambiguous (format t "~&[model] 名称有歧义。~%"))
+             (:out-of-range (format t "~&[model] 编号超出范围（1..~a）。~%" (length ids))))))))))
+
+(defun set-model (agent id)
+  "Switch the agent's model, keeping the conversation. Prints confirmation."
+  (setf (agent-cl.loop:agent-model agent) id)
+  (format t "~&[model] 已切换到 ~a（对话历史保留）~%" id))
+
+(defun repl-set-model (agent name)
+  "Set the model by exact name (or unique prefix if the list is fetchable)."
+  (let ((ids (fetch-model-ids)))
+    (if ids
+        (multiple-value-bind (id status)
+            (agent-cl.session:resolve-session-choice name ids)
+          (case status
+            (:ok (set-model agent id))
+            (:none (set-model agent name))   ; let the API reject unknown names
+            (:ambiguous (format t "~&[model] ~a 匹配多个模型，请输入完整名。~%" name))
+            (:out-of-range (set-model agent name))))
+        (set-model agent name))))
 
 (defun cache-hit-rate (agent)
   "Prompt-cache hit ratio in [0,1], or NIL when the provider never reported

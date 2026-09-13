@@ -148,3 +148,13 @@
                        :tool-calls (parse-tool-calls (getf msg :TOOL-CALLS))
                        :finish-reason (getf first :FINISH-REASON)
                        :usage (normalize-usage (getf wire :USAGE)))))))
+
+(defun parse-models-response (json-string)
+  "Parse a GET /models response into a list of model-id strings, in order.
+  Shape: {\"object\":\"list\",\"data\":[{\"id\":\"deepseek-chat\",...},...]}.
+  Tolerant: skips entries without a string :id. Pure."
+  (let* ((wire (agent-cl.core:decode-to-plist json-string))
+         (data (getf wire :DATA)))
+    (loop for entry in data
+          for id = (and (listp entry) (getf entry :ID))
+          when (and id (stringp id)) collect id)))

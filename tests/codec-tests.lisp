@@ -64,3 +64,17 @@
   (let ((tr (make-mock-transport :script nil)))
     (signals-error transport-error
       (complete-turn tr (list :messages (list (user-message "x")))))))
+
+
+;;;; parse-models-response (GET /models) --------------------------------
+(deftest parse-models-response-basic
+  (let ((json "{\"object\":\"list\",\"data\":[{\"id\":\"deepseek-flash\",\"object\":\"model\"},{\"id\":\"deepseek-v4-pro\",\"object\":\"model\"}]}"))
+    (is-equal '("deepseek-flash" "deepseek-v4-pro")
+              (agent-cl.llm:parse-models-response json))))
+
+(deftest parse-models-response-skips-bad-entries
+  (let ((json "{\"data\":[{\"id\":\"a\"},{\"no_id\":1},{\"id\":\"b\"}]}"))
+    (is-equal '("a" "b") (agent-cl.llm:parse-models-response json))))
+
+(deftest parse-models-response-empty
+  (is-equal '() (agent-cl.llm:parse-models-response "{\"data\":[]}")))

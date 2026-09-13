@@ -80,7 +80,8 @@
    ;; --- wire codec ---
    #:encode-request-json #:encode-message-wire #:parse-chat-json
    #:usage-prompt-tokens #:usage-completion-tokens #:usage-total-tokens
-   #:usage-cache-hit-tokens #:usage-cache-miss-tokens))
+   #:usage-cache-hit-tokens #:usage-cache-miss-tokens
+   #:parse-models-response))
 
 (defpackage #:agent-cl.schema
   (:use #:cl)
