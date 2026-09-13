@@ -1091,9 +1091,14 @@
                                     (getf *footer* :scroll-bottom)))
                     (finish-output)
                     t)
-                  ;; the screen became too short to pin a footer
-                  (footer-disable)
-                  nil))))))))
+                  ;; the screen became too short to pin a footer: hand the
+                  ;; terminal back and report "no geometry change". NOTE: this
+                  ;; needs its own PROGN — an IF takes at most three elements, and
+                  ;; writing (if test then else nil) is a compile-time ERROR that
+                  ;; leaves the whole function undefined.
+                  (progn
+                    (footer-disable)
+                    nil)))))))))
 
 (defun ask-turn (agent line)
   (unwind-protect
