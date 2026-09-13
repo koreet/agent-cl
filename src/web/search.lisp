@@ -280,8 +280,33 @@
   "Test seam: when bound to (lambda (backend query max) -> results), it replaces
   the real network call so cache/budget logic can be verified offline.")
 
+(defparameter *search-cache-max-entries* 200
+  "Upper bound on cached result sets. The cache existed to save quota, but an
+  agent iterating over generated queries could grow it without limit (each entry
+  holding a full result set) for the life of the process.")
+
+(defun normalize-query (query)
+  "Canonical cache/identity form of QUERY: trimmed, case-folded, and with runs of
+  whitespace collapsed. Without this, \"  DeepSeek  API \" and \"deepseek api\"
+  were separate cache entries AND separate billable requests."
+  (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return) (or query "")))
+         (out (make-string-output-stream))
+         (pending-space nil)
+         (wrote nil))
+    ;; a local flag rather than FILE-POSITION: not every implementation supports
+    ;; file-position on a string output stream
+    (loop for ch across s
+          do (if (member ch '(#\Space #\Tab #\Newline #\Return))
+                 (setf pending-space t)
+                 (progn (when (and pending-space wrote)
+                          (write-char #\Space out))
+                        (setf pending-space nil
+                              wrote t)
+                        (write-char (char-downcase ch) out))))
+    (get-output-stream-string out)))
+
 (defun cache-key (backend query max)
-  (list backend query max))
+  (list backend (normalize-query query) max))
 
 (defun cache-lookup (key)
   "Cached results for KEY when still fresh, else NIL (expired entries drop)."
@@ -295,6 +320,17 @@
 
 (defun cache-store (key results)
   (when (plusp *search-cache-ttl*)
+    ;; Bounded cache: when full, drop the entries that have been in there longest
+    ;; (their timestamps are the oldest), then add the new one.
+    (when (and *search-cache-max-entries*
+               (>= (hash-table-count *search-cache*) *search-cache-max-entries*)
+               (null (gethash key *search-cache*)))
+      (let ((stale (loop for k being the hash-keys of *search-cache*
+                           using (hash-value v)
+                         collect (cons k (car v)))))
+        (dolist (pair (subseq (sort stale #'< :key #'cdr)
+                              0 (max 1 (floor (length stale) 4))))
+          (remhash (car pair) *search-cache*))))
     (setf (gethash key *search-cache*)
           (cons (get-universal-time) results)))
   results)
@@ -331,10 +367,11 @@
   "Max REAL searches a single delegated child agent may issue. NIL = no extra
   per-child cap (the process budget still applies).")
 
-(defvar *child-search-usage* (make-hash-table :test 'eq)
-  "Child agent object -> real searches it has issued. Cleared by
-  reset-child-search-budget; entries keep their child object alive, which is
-  bounded by the number of children created in a session.")
+(defvar *child-search-usage* (make-hash-table :test 'eq :weakness :key)
+  "Child agent object -> real searches it has issued. KEY-WEAK, so a child agent
+  that has finished can be collected: with a plain EQ table the table itself kept
+  every child that ever searched alive for the life of the process. Cleared by
+  reset-child-search-budget.")
 
 (defun agent-depth-safe (ctx)
   "Depth of the agent in CTX (0 = top-level). Resolved at runtime because this
@@ -369,16 +406,23 @@
   (when budget (setf *child-search-budget* budget))
   *child-search-budget*)
 
+(defun quota-status-p (message status)
+  "True when STATUS is 429/432, or MESSAGE contains a quota phrase. An explicit
+  status is authoritative; the text test is the fallback."
+  (or (and (integerp status) (member status '(429 432)))
+      (let ((m (string-downcase (or message ""))))
+        ;; Phrase matching, not bare \"/432/\": a substring test fired on any
+        ;; message that merely CONTAINED those digits (a byte count, a result id,
+        ;; a URL), tripping the breaker and pinning the budget to zero.
+        (some (lambda (needle) (search needle m))
+              '("usage limit" "rate limit" "quota" "exceeds your plan"
+                "too many requests" "http 429" "http 432"
+                "error 429" "error 432" "status 429" "status 432")))))
+
 (defun quota-error-p (message)
   "True when MESSAGE looks like a provider quota/rate-limit rejection, so we
   trip the breaker instead of letting the agent hammer a dead endpoint."
-  (let ((m (string-downcase (or message ""))))
-    (or (search "432" m)
-        (search "429" m)
-        (search "usage limit" m)
-        (search "rate limit" m)
-        (search "quota" m)
-        (search "exceeds your plan" m))))
+  (quota-status-p message nil))
 
 (defun trip-search-breaker (message)
   "Stop spending: mark the quota as exhausted and pin the budget to what has
@@ -483,8 +527,12 @@
                         :ok)
                 (values "没有找到相关结果" :error)))
         (error (e)
-          (let ((msg (format nil "~a" e)))
-            (if (quota-error-p msg)
+          (let* ((status (and (typep e 'agent-cl.core:transport-error)
+                              (agent-cl.core:transport-error-status e)))
+                 (msg (format nil "~a" e)))
+            ;; An explicit HTTP status is authoritative: string-matching the
+            ;; message is a fallback, not the primary signal.
+            (if (quota-status-p msg status)
                 (values (format nil "检索失败（已熔断，后续检索不再发出）: ~a"
                                 (trip-search-breaker msg))
                         :error)

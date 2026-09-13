@@ -138,31 +138,63 @@
 ;;; code.exec — let the model write code and execute it (self-hosting loop)
 ;;; ---------------------------------------------------------------------------
 
+(defun find-unix-shell ()
+  "Path of a POSIX shell on this host, or NIL.
+
+  `sh` used to be run as `cmd /c <file>` on Windows, which cannot execute a shell
+  script at all: the command failed (or, worse, exited 0 while doing nothing) and
+  the model was told its code had run. Reporting 'no POSIX shell here' is the
+  honest answer; Git for Windows usually provides one."
+  (or (let ((env (or (uiop:getenv "SHELL") (uiop:getenv "AGENT_CL_SH"))))
+        (and env (uiop:file-exists-p env) env))
+      (when (uiop:os-windows-p)
+        (some (lambda (p) (and (uiop:file-exists-p p) p))
+              '("C:\\Program Files\\Git\\bin\\sh.exe"
+                "C:\\Program Files\\Git\\usr\\bin\\sh.exe"
+                "C:\\Program Files (x86)\\Git\\bin\\sh.exe")))
+      (when (uiop:os-windows-p)
+        (loop for d in (uiop:split-string (or (uiop:getenv "PATH") "")
+                                          :separator ";")
+              for cand = (and d (plusp (length (string-trim '(#\Space) d)))
+                              (merge-pathnames
+                               "sh.exe" (uiop:ensure-directory-pathname d)))
+              when (and cand (uiop:file-exists-p cand))
+                return (namestring cand)))
+      (unless (uiop:os-windows-p)
+        (some (lambda (p) (and (uiop:file-exists-p p) p))
+              '("/bin/sh" "/usr/bin/sh")))))
+
 (defun interpreter-command (language code file)
-  "Return (values argv ext env-patch?) for LANGUAGE and the temp source FILE."
+  "Return (values argv ext) for LANGUAGE and the temp source FILE. EXT is the
+  file extension the interpreter expects; a NIL ARGV means 'cannot run this here'
+  and the caller reports it instead of running something else."
+  (declare (ignore code))
   (let ((lang (string-downcase (or language "python"))))
     (cond
-      ((string= lang "python") (values (list "python" file) ".py"))
-      ((string= lang "py")     (values (list "python" file) ".py"))
+      ((or (string= lang "python") (string= lang "py"))
+       (values (list (if (uiop:os-windows-p) "python" "python3") file) ".py"))
       ((string= lang "sbcl")
        (let* ((home (uiop:getenv "SBCL_HOME"))
               (sep (if (uiop:os-windows-p) "\\" "/"))
+              (exe-name (if (uiop:os-windows-p) "sbcl.exe" "sbcl"))
               (home-exe (and home
-                             (let ((cand (format nil "~a~asbcl.exe"
-                                                  (string-right-trim '(#\\ #\/) home) sep)))
+                             (let ((cand (format nil "~a~a~a"
+                                                 (string-right-trim '(#\\ #\/) home)
+                                                 sep exe-name)))
                                (and (uiop:file-exists-p cand) cand))))
               ;; running SBCL's own executable is the most reliable source
               (self (and (find-package "SB-EXT")
-                         (symbol-value (find-symbol "*RUNTIME-PATHNAME*" "SB-EXT"))))
-              (exe (or home-exe
-                       (and self (namestring self))
-                       "sbcl")))
+                         (let ((sym (find-symbol "*RUNTIME-PATHNAME*" "SB-EXT")))
+                           (and sym (boundp sym) (symbol-value sym)))))
+              (exe (or home-exe (and self (namestring self)) exe-name)))
          (values (list exe "--noinform" "--disable-debugger" "--script" file)
                  ".lisp")))
-      ((string= lang "sh")
-       (values (if (uiop:os-windows-p) (list "cmd" "/c" file)
-                   (list "/bin/sh" file))
-               ".sh"))
+      ((or (string= lang "sh") (string= lang "bash") (string= lang "shell"))
+       (let ((sh (find-unix-shell)))
+         (if sh
+             (values (list sh file) ".sh")
+             ;; ARGV is deliberately NIL: see FIND-UNIX-SHELL
+             (values nil nil))))
       (t (values nil nil)))))
 
 (defun code-exec (args ctx)
@@ -174,34 +206,39 @@
     (unless code
       (return-from code-exec (values "missing :code" :error)))
     (multiple-value-bind (argv ext)
-        (interpreter-command language code "unused")
-      (declare (ignore ext))
+        (interpreter-command language code nil)
       (unless argv
         (return-from code-exec
-          (values (format nil "unsupported language ~s (use python|sbcl|sh)"
-                          language)
-                  :error))))
-    (let* ((dir (uiop:ensure-directory-pathname
-                 (merge-pathnames ".tools/tmp/code-exec/"
-                                  (uiop:getcwd))))
-           (file (namestring
-                  (merge-pathnames
-                   (format nil "run-~a~a" (agent-cl.core:uuid-string) ".tmp")
-                   dir))))
-      (ensure-directories-exist dir)
-      (unwind-protect
-           (progn
-             (agent-cl.core:write-file-string file code)
-             (multiple-value-bind (argv ext)
-                 (interpreter-command language code file)
-               (declare (ignore ext))
+          (values (if (member (string-downcase (or language ""))
+                              '("sh" "bash" "shell") :test #'string=)
+                      "本机没有可用的 POSIX shell（sh）；Windows 上请用 python/sbcl，或安装 Git for Windows（含 sh.exe）"
+                      (format nil "unsupported language ~s (use python|sbcl|sh)"
+                              language))
+                  :error)))
+      (let* ((dir (uiop:ensure-directory-pathname
+                   (merge-pathnames ".tools/tmp/code-exec/"
+                                    (uiop:getcwd))))
+             ;; Use the extension the interpreter expects: everything used to be
+             ;; written as .tmp, so a run left a file with no hint about what it
+             ;; contained (and no interpreter could infer the language from it).
+             (file (namestring
+                    (merge-pathnames
+                     (format nil "run-~a~a" (agent-cl.core:uuid-string)
+                             (or ext ".txt"))
+                     dir)))
+             (argv (append (butlast argv) (list file))))
+        (ensure-directories-exist dir)
+        (unwind-protect
+             (progn
+               (agent-cl.core:write-file-string file code)
                (multiple-value-bind (out err exit)
                    (handler-case
                        (agent-cl.core:run-program-with-timeout argv
-                                                        :timeout timeout)
+                                                               :timeout timeout)
                      (error (e)
                        (return-from code-exec
-                         (values (format nil "cannot run ~a: ~a" (or language "python") e)
+                         (values (format nil "cannot run ~a: ~a"
+                                         (or language "python") e)
                                  :error))))
                  (let* ((clean-err (string-trim '(#\Space #\Tab #\Newline #\Return)
                                                 (or err "")))
@@ -214,8 +251,8 @@
                    (if (and (integerp exit) (zerop exit)
                             (zerop (length clean-err)))
                        (values text :ok)
-                       (values text :error))))))
-        (ignore-errors (delete-file file))))))
+                       (values text :error)))))
+          (ignore-errors (delete-file file)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; registration
@@ -340,11 +377,52 @@
     (ensure-directories-exist d)
     d))
 
+(defparameter *reserved-filenames*
+  '("con" "prn" "aux" "nul" "com1" "com2" "com3" "com4" "com5" "com6" "com7"
+    "com8" "com9" "lpt1" "lpt2" "lpt3" "lpt4" "lpt5" "lpt6" "lpt7" "lpt8" "lpt9")
+  "Windows device names: a file called con.json is unusable there, whatever the
+  extension.")
+
+(defun memory-key-stem (key)
+  "Injective, filesystem-safe filename stem for KEY.
+
+  Injectivity is the whole point: the previous scheme hex-escaped other
+  characters WITHOUT escaping the escape, so the key \"a b\" produced \"a20b\" and
+  collided with the literal key \"a20b\" — one memory silently overwrote the
+  other. Here '_' is the escape introducer and is itself escaped:
+      [a-z0-9-]  -> itself
+      '_'        -> \"_5f\"
+      anything   -> \"_\" + 2 lowercase hex digits
+  Lowercase-only is deliberate: Windows filenames are case-insensitive, so
+  \"ABC\" and \"abc\" would otherwise share one file. Reserved device names get a
+  '_' prefix (a literal leading '_' is already escaped, so this adds no new
+  collision)."
+  (let* ((s (if (stringp key) key (princ-to-string key)))
+         (stem (with-output-to-string (out)
+                 (loop for ch across s
+                       do (if (or (char<= #\a ch #\z)
+                                  (digit-char-p ch)
+                                  (char= ch #\-))
+                              (write-char ch out)
+                              ;; ~(...~) forces lower case: SBCL prints ~x in
+                              ;; upper case, so relying on the directive's case
+                              ;; made 'a_b' encode differently per implementation.
+                              (format out "_~(~2,'0x~)" (char-code ch)))))))
+    (cond ((zerop (length stem)) "_")
+          ((member stem *reserved-filenames* :test #'string-equal)
+           (concatenate 'string "_" stem))
+          (t stem))))
+
 (defun memory-key-file (key)
-  "Map KEY to a file path under the memory dir. The filename is an injective
-  (reversible) encoding: [A-Za-z0-9._-] stay literal, any other char becomes
-  its lowercase 2-digit hex code — so 'a-b', 'a b', 'a/b' never collide (they
-  previously all collapsed to a_b.json and silently overwrote each other)."
+  "Map KEY to its memory file under the memory dir (see MEMORY-KEY-STEM)."
+  (merge-pathnames (format nil "~a.json" (memory-key-stem key)) (memory-dir)))
+
+(defun legacy-memory-key-file (key)
+  "The pre-fix filename for KEY: a read-only fallback so memories written by an
+  older build stay recallable. New writes always use MEMORY-KEY-FILE.
+
+  NB: its output (including the hex CASE) must not be modernised — this exists to
+  match file names that are already on disk."
   (let* ((s (if (stringp key) key (princ-to-string key)))
          (safe (with-output-to-string (out)
                  (loop for ch across s
@@ -353,6 +431,17 @@
                               (write-char ch out)
                               (format out "~2,'0x" (char-code ch)))))))
     (merge-pathnames (format nil "~a.json" safe) (memory-dir))))
+
+(defun legacy-memory-key-candidates (key)
+  "Legacy paths for KEY: the historical name plus its case-folded variant, since
+  the hex case depended on the implementation's ~x behavior."
+  (let* ((f (legacy-memory-key-file key))
+         (dir (memory-dir))
+         (name (file-namestring f))
+         (lower (string-downcase name)))
+    (if (string= name lower)
+        (list f)
+        (list f (merge-pathnames lower dir)))))
 
 (defun memory-store (args ctx)
   (declare (ignore ctx))
@@ -379,10 +468,16 @@
   (declare (ignore ctx))
   (let ((key (getf args :KEY)))
     (unless key (return-from memory-recall (values "missing :key" :error)))
-    (let ((f (memory-key-file key)))
-      (if (uiop:file-exists-p f)
-          (values (agent-cl.core:read-file-string f) :ok)
-          (values (format nil "no memory for ~a" key) :error)))))
+    (let ((f (memory-key-file key))
+          (old (legacy-memory-key-candidates key)))
+      (cond
+        ((uiop:file-exists-p f)
+         (values (agent-cl.core:read-file-string f) :ok))
+        ;; memories written before the encoding was made injective
+        ((find-if #'uiop:file-exists-p old)
+         (values (agent-cl.core:read-file-string (find-if #'uiop:file-exists-p old))
+                 :ok))
+        (t (values (format nil "no memory for ~a" key) :error))))))
 
 (defun register-builtin-tools (&optional (registry *tool-registry*))
   "Register shell/file/time tools into REGISTRY. Returns the list of names."

@@ -11,7 +11,31 @@
   ((id       :initarg :id       :initform (agent-cl.core:uuid-string)
              :accessor session-id)
    (path     :initarg :path     :accessor session-path)
-   (events   :initarg :events   :initform nil :accessor session-events)))
+   (events   :initarg :events   :initform nil :accessor session-events)
+   ;; Tail CONS of EVENTS, so appending is O(1). APPEND-ing the whole list on
+   ;; every event made a long session quadratic (and copied the transcript each
+   ;; time).
+   (tail     :initarg :tail     :initform nil :accessor session-tail)))
+
+(defvar *session-lock* (bt:make-lock "agent-cl-session")
+  "Serializes event appends: two threads writing the same session file could
+  otherwise interleave partial lines and corrupt the JSONL log.")
+
+(defun session-set-events (session events)
+  "Install EVENTS as the session's in-memory log, fixing up the tail pointer."
+  (setf (session-events session) events
+        (session-tail session) (last events))
+  events)
+
+(defun session-record-event (session decoded)
+  "Append DECODED to the in-memory log in O(1)."
+  (let ((cell (list decoded)))
+    (if (session-tail session)
+        (progn (setf (cdr (session-tail session)) cell)
+               (setf (session-tail session) cell))
+        (setf (session-events session) cell
+              (session-tail session) cell))
+    decoded))
 
 (defvar *default-session-root*
   ;; writable even in the offline sandbox; override via make-session :directory
@@ -36,7 +60,7 @@
         (s (make-session :id id :directory directory)))
     (when (and (uiop:directory-exists-p dir)
                (uiop:file-exists-p (merge-pathnames "events.jsonl" dir)))
-      (setf (session-events s) (session-replay s)))
+      (session-set-events s (session-replay s)))
     s))
 
 (defun event-json (event)
@@ -49,25 +73,28 @@
   "Append EVENT (wire hash-table or simple plist) as one JSONL line and keep
   the decoded tail in memory."
   (let ((json (event-json event)))
-    (agent-cl.core:write-file-string
-     (session-path session)
-     (concatenate 'string json (string #\Newline))
-     :if-exists :append)
-    (setf (session-events session)
-          (append (session-events session)
-                  (list (agent-cl.core:decode-to-plist json))))
+    (bt:with-lock-held (*session-lock*)
+      (agent-cl.core:write-file-string
+       (session-path session)
+       (concatenate 'string json (string #\Newline))
+       :if-exists :append)
+      (session-record-event session (agent-cl.core:decode-to-plist json)))
     event))
 
 (defun session-replay (session)
   "Read all events back from disk as plists. A corrupt line (crash residue,
   partial write, external edit) is skipped with a warning instead of aborting
-  the whole session replay."
+  the whole session replay.
+
+  The file is read LENIENTLY: a strict UTF-8 read raised on a single stray byte
+  (e.g. ANSI text captured from a subprocess), which defeated the whole
+  skip-the-corrupt-line design by failing the entire replay."
   (let ((path (session-path session)))
     (when (uiop:file-exists-p path)
       (let ((bad 0)
             (events nil))
         (dolist (line (uiop:split-string
-                       (agent-cl.core:read-file-string path)
+                       (or (agent-cl.core:read-file-lenient path) "")
                        :separator '(#\Newline)))
           (let ((trimmed (string-trim '(#\Return #\Space) line)))
             (unless (string= trimmed "")
@@ -92,36 +119,50 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun message->event (msg)
-  "MSG as an appendable wire hash with a \"type\": \"message\" discriminator."
+  "MSG as an appendable wire hash with a \"type\": \"message\" discriminator and
+  a TS timestamp. Without TS, SESSION-LAST-TS was NIL for every message event, so
+  a session's age/order was invisible."
   (let ((h (agent-cl.llm:encode-message-wire msg)))
     (setf (gethash "type" h) "message")
+    (setf (gethash "ts" h) (agent-cl.core:now-iso8601))
     h))
 
+(defun event-role (event)
+  "Keyword role of a message EVENT, or NIL when the role is missing/unknown."
+  (let ((r (getf event :ROLE)))
+    (and (stringp r)
+         (let ((k (intern (string-upcase r) :keyword)))
+           (and (member k '(:system :user :assistant :tool)) k)))))
+
 (defun event->message (event)
-  "Rebuild a message from a replay event plist."
-  (let ((role (ecase (intern (string-upcase (getf event :ROLE)) :keyword)
-                (:SYSTEM :system) (:USER :user) (:ASSISTANT :assistant)
-                (:TOOL :tool))))
-    (cond
-      ((eq role :tool)
-       (agent-cl.messages:tool-result-message
-        (getf event :TOOL-CALL-ID)
-        (or (getf event :CONTENT) "")
-        :name (getf event :NAME)))
-      ((and (eq role :assistant) (getf event :TOOL-CALLS))
-       (agent-cl.messages:assistant-message
-        (or (getf event :CONTENT) "")
-        :tool-calls
-        (loop for tc in (getf event :TOOL-CALLS)
-              for fn = (getf tc :FUNCTION)
-              collect (agent-cl.messages:make-tool-call
-                       (getf tc :ID)
-                       (getf fn :NAME)
-                       (or (getf fn :ARGUMENTS) "{}")))))
-      (t
-       (agent-cl.messages:make-message
-        role :content (or (getf event :CONTENT) "")
-        :name (getf event :NAME))))))
+  "Rebuild a message from a replay event plist, or NIL when the event carries no
+  usable role. An unknown role used to hit ECASE and abort the whole replay, so a
+  single unexpected line made the entire session unloadable."
+  (let ((role (event-role event)))
+    (when role
+      (cond
+        ((eq role :tool)
+         (agent-cl.messages:tool-result-message
+          (getf event :TOOL-CALL-ID)
+          (or (getf event :CONTENT) "")
+          :name (getf event :NAME)))
+        ((and (eq role :assistant) (getf event :TOOL-CALLS))
+         (agent-cl.messages:assistant-message
+          (or (getf event :CONTENT) "")
+          :name (getf event :NAME)
+          :tool-calls
+          (loop for tc in (getf event :TOOL-CALLS)
+                for i from 0
+                for fn = (getf tc :FUNCTION)
+                collect (agent-cl.messages:make-tool-call
+                         ;; keep the pairing valid even if the log lost an id
+                         (or (getf tc :ID) (format nil "call_~a" i))
+                         (getf fn :NAME)
+                         (or (getf fn :ARGUMENTS) "{}")))))
+        (t
+         (agent-cl.messages:make-message
+          role :content (or (getf event :CONTENT) "")
+          :name (getf event :NAME)))))))
 
 (defun persist-message (session msg)
   "Append MSG to SESSION; returns the event."
@@ -130,10 +171,11 @@
     event))
 
 (defun replayed-messages (session)
-  "All message events reconstructed in order."
+  "All message events reconstructed in order (events with an unusable role are
+  dropped)."
   (loop for e in (session-events session)
         when (string= (getf e :TYPE) "message")
-          collect (event->message e)))
+          append (let ((m (event->message e))) (when m (list m)))))
 
 ;; ---------------------------------------------------------------------------
 ;; session discovery / summaries (REPL multi-session switching)
@@ -161,15 +203,26 @@
   (open-session id :directory directory))
 
 (defun session-first-user-text (session)
-  "First user message content of SESSION (for list previews), or NIL."
-  (let ((m (find-if (lambda (e) (string= (getf e :TYPE) "message"))
-                    (session-events session))))
-    (when m
-      (let ((r (getf m :ROLE)))
-        (when (and r (string= r "user"))
-          (let ((c (getf m :CONTENT)))
-            (and c (string-trim '(#\Space #\Tab #\Newline #\Return #\")
-                                 (subseq c 0 (min 40 (length c)))))))))))
+  "Preview text for SESSION: the first USER message that has content, collapsed
+  to a single line. NIL when the session has no user message yet.
+
+  It used to look only at the FIRST message event, so a session whose log starts
+  with a checkpoint (or an assistant message) showed no preview at all."
+  (let ((c (loop for e in (session-events session)
+                 when (and (string= (getf e :TYPE) "message")
+                           (let ((r (getf e :ROLE)))
+                             (and (stringp r) (string-equal r "user")))
+                           (getf e :CONTENT))
+                   return (getf e :CONTENT))))
+    (when c
+      (let* ((flat (substitute #\Space #\Newline
+                               (substitute #\Space #\Return
+                                           (substitute #\Space #\Tab c))))
+             (trimmed (string-trim '(#\Space #\") flat)))
+        (when (plusp (length trimmed))
+          (if (> (length trimmed) 60)
+              (concatenate 'string (subseq trimmed 0 60) "…")
+              trimmed))))))
 
 (defun session-message-count (session)
   (count-if (lambda (e) (string= (getf e :TYPE) "message"))

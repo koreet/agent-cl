@@ -196,30 +196,49 @@
                           (state-plist :status :adopted
                                        :detail (or detail "gate passed")))
                          (t
-                          ;; 4 rollback from backup
-                          (agent-cl.core:write-file-string pathname old-content
-                                                           :if-exists :supersede)
-                          (when (probe-file bak) (delete-file bak))
-                          (state-plist :status :rolled-back
-                                       :detail (or detail "gate failed"))))))))))))
+                          ;; 4 rollback from backup. A FAILED rollback must be
+                          ;; reported as such: folding it into the generic
+                          ;; :rejected path left a half-patched file with no way
+                          ;; to tell that the ROLLBACK (not the patch) failed.
+                          (handler-case
+                              (progn
+                                (agent-cl.core:write-file-string
+                                 pathname old-content :if-exists :supersede)
+                                (when (probe-file bak) (delete-file bak))
+                                (state-plist :status :rolled-back
+                                             :detail (or detail "gate failed")))
+                            (error (e)
+                              (state-plist
+                               :status :rollback-failed
+                               :retained t
+                               :detail
+                               (format nil "gate 失败，且回滚写回也失败（文件可能仍是补丁内容）: ~a；备份保留在 ~a"
+                                       e (namestring bak)))))))))))))))
     (error (e)
       (state-plist :status :rejected :detail (format nil "~a" e)))))
 
 (defun find-sbcl-exec ()
   "Return a pathname of an sbcl executable, or NIL. Lookup order: the
-  AGENT_CL_SBCL env override, the PATH list, then the Windows install dir."
-  (or (and (uiop:getenv "AGENT_CL_SBCL")
-           (probe-file (uiop:getenv "AGENT_CL_SBCL")))
-      (block search
-        (dolist (d (uiop:split-string (or (uiop:getenv "PATH") "") :separator ";"))
-          (when (and d (plusp (length (string-trim '(#\Space) d))))
-            (let ((cand (probe-file
-                         (merge-pathnames
-                          "sbcl.exe" (uiop:ensure-directory-pathname d)))))
-              (when cand (return-from search cand)))))
-        nil)
-      (and (uiop:os-windows-p)
-           (probe-file "C:\\Program Files\\Steel Bank Common Lisp\\sbcl.exe"))))
+  AGENT_CL_SBCL env override, then the PATH list.
+
+  POSIX-aware: the PATH separator is ':' and the executable is 'sbcl' there —
+  hard-coding ';' and 'sbcl.exe' made the real gate report 'no sbcl executable
+  found' on every non-Windows host."
+  (let ((exe (if (uiop:os-windows-p) "sbcl.exe" "sbcl"))
+        (sep (if (uiop:os-windows-p) ";" ":")))
+    (or (let ((env (uiop:getenv "AGENT_CL_SBCL")))
+          (and env (probe-file env)))
+        (block search
+          (dolist (d (uiop:split-string (or (uiop:getenv "PATH") "") :separator sep))
+            (when (and d (plusp (length (string-trim '(#\Space) d))))
+              (let ((cand (ignore-errors
+                           (probe-file (merge-pathnames
+                                        exe (uiop:ensure-directory-pathname d))))))
+                (when cand (return-from search cand)))))
+          nil)
+        ;; last resort: the usual Windows install location
+        (and (uiop:os-windows-p)
+             (probe-file "C:\\Program Files\\Steel Bank Common Lisp\\sbcl.exe")))))
 
 (defun tail-string (s n)
   "Return up to the last N characters of S, trim whitespace, as one string."

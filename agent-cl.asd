@@ -79,6 +79,7 @@
    (:file "dsl-tests")
    (:file "dsl-hardening-tests")
    (:file "session-tests")
+   (:file "store-hardening-tests")
    (:file "render-tests")
    (:file "web-tests")
    (:file "terminal-tests")
