@@ -200,6 +200,27 @@
       (ignore-errors
        (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
+(deftest session-empty-p-distinguishes-checkpoints-from-conversation
+  "A REPL start writes a checkpoint immediately, so 'the file exists' does not
+  mean the user talked here — and /sessions filled up with 0-message rows."
+  (let* ((dir (merge-pathnames (format nil ".tools/tmp/sess-~a/"
+                                       (agent-cl.core:uuid-string))
+                               (uiop:getcwd)))
+         (s (agent-cl.session:make-session :directory dir)))
+    (unwind-protect
+         (progn
+           (ok (agent-cl.session:session-empty-p s)
+               "a brand-new session has no conversation")
+           (agent-cl.session:save-checkpoint s "session-start")
+           (ok (agent-cl.session:session-empty-p s)
+               "a checkpoint-only session is still empty")
+           (agent-cl.session:persist-message s (user-message "hi"))
+           (ok (not (agent-cl.session:session-empty-p s))
+               "one message makes it a conversation")
+           (is-equal 1 (agent-cl.session:session-message-count s)))
+      (ignore-errors
+       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; web.search guards
 ;;; ---------------------------------------------------------------------------

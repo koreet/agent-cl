@@ -228,6 +228,13 @@
   (count-if (lambda (e) (string= (getf e :TYPE) "message"))
             (session-events session)))
 
+(defun session-empty-p (session)
+  "True when SESSION holds no CONVERSATION: it has no message events, only
+  bookkeeping ones (a REPL start writes a checkpoint immediately, so 'the file
+  exists' does not mean 'the user talked here'). Such sessions are what clutters
+  /sessions after a few dozen starts."
+  (zerop (session-message-count session)))
+
 (defun session-last-ts (session)
   "Timestamp of the last event, or NIL."
   (let ((last (first (last (session-events session)))))

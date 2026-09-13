@@ -573,27 +573,60 @@
   "Only prune a session directory that has been empty for at least this long, so
   a session another REPL instance is still starting up is never deleted.")
 
-(defun prune-empty-sessions ()
-  "Delete session directories that contain no events.jsonl. These come from
-  sessions that were created but never written to (e.g. a repl started and
-  exited without a real turn); they hold no user data, only clutter the list.
+(defun session-dir-id (dir)
+  "Session id (final path component) of session directory DIR."
+  (car (last (pathname-directory dir))))
 
-  Only directories older than *prune-min-age-seconds* are touched, and the
-  current session is never touched: a session mid-startup (another REPL instance,
-  or this one before its first checkpoint) is EMPTY for a moment, and pruning it
-  broke that instance's writes."
+(defun conversation-less-session-dir-p (dir)
+  "True when DIR holds no conversation: no events.jsonl at all, or one whose
+  events are only bookkeeping (a checkpoint). Returns (values P T) where T is when
+  it was last touched.
+
+  'No events.jsonl' was the only test before, but REPL-NEW-SESSION writes a
+  session-start checkpoint immediately — so every REPL start left a directory with
+  a file in it, pruned by nothing and listed by /sessions as a 0-message session.
+  After a few dozen starts the list was mostly empty rows."
+  (let* ((file (merge-pathnames "events.jsonl" dir))
+         (has (uiop:file-exists-p file))
+         (touched (or (ignore-errors (file-write-date (if has file dir)))
+                      (ignore-errors (file-write-date dir)))))
+    (if (not has)
+        (values t touched)
+        (let ((s (handler-case
+                     (agent-cl.session:open-session (session-dir-id dir)
+                                                    :directory (session-root))
+                   (error () nil))))
+          (values (and s (agent-cl.session:session-empty-p s)) touched)))))
+
+(defun prune-empty-sessions ()
+  "Delete session directories that hold no CONVERSATION — no events.jsonl, or only
+  checkpoint events. These come from REPLs that started and were never used: they
+  hold no user data, only clutter.
+
+  Two guards, because pruning is destructive:
+    * never the CURRENT session (its neighbours are also mid-startup for a
+      moment), and
+    * only entries untouched for *PRUNE-MIN-AGE-SECONDS*, so a session another
+      REPL instance just created is safe.
+
+  Returns the number of sessions removed."
   (let ((root (session-root))
         (now (get-universal-time))
-        (current (and *repl-session* (agent-cl.session:session-id *repl-session*))))
+        (current (and *repl-session* (agent-cl.session:session-id *repl-session*)))
+        (removed 0))
     (dolist (sub (uiop:subdirectories root))
-      (let ((id (car (last (pathname-directory sub)))))
+      (let ((id (session-dir-id sub)))
         (unless (and current (string= id current))
-          (unless (uiop:file-exists-p (merge-pathnames "events.jsonl" sub))
-            (let ((mtime (ignore-errors (file-write-date sub))))
-              (when (and mtime (> (- now mtime) *prune-min-age-seconds*))
-                (ignore-errors
-                 (uiop:delete-directory-tree sub :validate t
-                                                 :if-does-not-exist :ignore))))))))))
+          (multiple-value-bind (empty touched) (conversation-less-session-dir-p sub)
+            (when (and empty touched (> (- now touched) *prune-min-age-seconds*))
+              (when (ignore-errors
+                      (uiop:delete-directory-tree sub :validate t
+                                                      :if-does-not-exist :ignore)
+                      t)
+                (incf removed)))))))
+    (when (plusp removed)
+      (format t "~&[session] 已清理 ~a 个空会话（只有检查点、没有对话）。~%" removed))
+    removed))
 
 (defun repl-new-session (agent)
   "开始一个新会话：把当前 agent 消息清空并绑定新 session id。
@@ -615,6 +648,25 @@
   (format t "~&[session] 新会话 ~a~%" (agent-cl.session:session-id *repl-session*))
   *repl-session*)
 
+(defvar *quit-requested* nil
+  "/quit sets this; the loop then RETURNS instead of calling UIOP:QUIT, so the
+  normal exit path (hand the terminal back, drop an unused session) always runs.")
+
+(defun cleanup-on-exit ()
+  "On exit, remove the CURRENT session when it never became a conversation.
+
+  A REPL that is started and closed without a single turn leaves a directory with
+  one checkpoint event in it — which is why /sessions filled up with 0-message
+  rows. Deleting just the events file and then the (now empty) directory keeps
+  this safe: anything that appeared in between stops the directory delete."
+  (when (and *repl-session*
+             (ignore-errors (agent-cl.session:session-empty-p *repl-session*)))
+    (let* ((path (agent-cl.session:session-path *repl-session*))
+           (dir (uiop:pathname-directory-pathname path)))
+      (when (ignore-errors (delete-file path) t)
+        (ignore-errors (uiop:delete-empty-directory dir))
+        (format t "~&[session] 没有对话内容，本次会话未保留。~%")))))
+
 (defun repl-persist-turn (agent)
   "把 agent-messages 里尚未落盘的消息追加进当前会话（增量，事件日志式）。"
   (let ((s *repl-session*))
@@ -635,6 +687,30 @@
                   failed (agent-cl.session:session-path s) first-error))
         (setf *persisted-count* (length msgs))))))
 
+(defun session-summaries ()
+  "One record (ID TS MESSAGE-COUNT SESSION) per session on disk, newest activity
+  first. The session object is carried along so the list does not load each file
+  twice. Unreadable sessions are reported as (ID NIL 0 NIL)."
+  (let ((out nil))
+    (dolist (id (agent-cl.session:session-ids (session-root)))
+      (let ((s (handler-case (agent-cl.session:load-session id :directory (session-root))
+                 (error () nil))))
+        (push (list id
+                    (and s (agent-cl.session:session-last-ts s))
+                    (if s (agent-cl.session:session-message-count s) 0)
+                    s)
+              out)))
+    (sort out #'string> :key (lambda (r) (or (second r) "")))))
+
+(defun sorted-session-ids (&optional include-empty)
+  "Session ids, most-recently-active first. Conversation-less sessions (startup
+  checkpoints that never became a conversation) are hidden unless INCLUDE-EMPTY,
+  so /sessions shows the sessions the user actually used."
+  (mapcar #'first
+          (if include-empty
+              (session-summaries)
+              (remove-if (lambda (r) (zerop (third r))) (session-summaries)))))
+
 (defun repl-session-line (s)
   "一行会话预览：id · 消息数 · 首句 · 最后事件时间。"
   (let* ((n (agent-cl.session:session-message-count s))
@@ -647,33 +723,28 @@
             (agent-cl.session:session-id s) n preview
             (or ts ""))))
 
-(defun sorted-session-ids ()
-  "Session ids, most-recently-active first (falls back to id order)."
-  (let ((ids (agent-cl.session:session-ids (session-root))))
-    (sort ids #'string> :key (lambda (id)
-                               (handler-case
-                                   (or (agent-cl.session:session-last-ts
-                                        (agent-cl.session:load-session
-                                         id :directory (session-root)))
-                                       "")
-                                 (error () ""))))))
-
-(defun repl-list-sessions ()
+(defun repl-list-sessions (&optional include-empty)
   "List sessions with an index so they can be picked by number. Returns the
-  ordered id list (same order as printed)."
-  (let ((ids (sorted-session-ids)))
-    (if ids
-        (progn
-          (format t "~&已保存会话（共 ~a 个）：~%" (length ids))
-          (loop for id in ids for i from 1
-                do (handler-case
-                       (let ((s (agent-cl.session:load-session
-                                 id :directory (session-root))))
-                         (format t "  ~2d) ~a~%" i (repl-session-line s)))
-                     (error (e)
-                       (format t "  ~2d) ~a  [读取失败: ~a]~%" i id e)))))
-        (format t "~&还没有已保存的会话。~%"))
-    ids))
+  ordered id list — the same order the numbers refer to, and (unless INCLUDE-EMPTY)
+  only sessions that actually hold a conversation."
+  (let* ((all (session-summaries))
+         (hidden (count-if (lambda (r) (zerop (third r))) all))
+         (shown (if include-empty
+                    all
+                    (remove-if (lambda (r) (zerop (third r))) all))))
+    (cond
+      (shown
+       (format t "~&已保存会话（共 ~a 个~@[，另有 ~a 个空会话未显示：/sessions all~]）：~%"
+               (length shown) (and (plusp hidden) hidden))
+       (loop for (id ts n s) in shown for i from 1
+             do (if s
+                    (format t "  ~2d) ~a~%" i (repl-session-line s))
+                    (format t "  ~2d) ~a  [读取失败]~%" i id))))
+      (all
+       (format t "~&没有带对话的会话；~a 个空会话（只有检查点）已隐藏：/sessions all 查看。~%"
+               (length all)))
+      (t (format t "~&还没有已保存的会话。~%")))
+    (mapcar #'first shown)))
 
 (defun repl-use-interactive (agent)
   "Prompt for a session by number/id/prefix (like /use but interactive)."
@@ -745,7 +816,7 @@
   (format t "  /export <file> 把当前会话导出为 JSONL~%")
   (format t "  /load <file>   载入 JSONL 会话继续对话~%")
   (format t "  /new           另起新会话（当前自动存档）~%")
-  (format t "  /sessions      列出已保存会话~%")
+  (format t "  /sessions [all] 列出已保存会话（默认隐藏只有检查点的空会话）~%")
   (format t "  /use [编号|id|前缀]  切换会话；不带参数则交互选择~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
   (format t "  /usage         显示模型 / token 用量 / 工作路径~%")
@@ -754,7 +825,7 @@
   (format t "  /engine new|legacy  渲染引擎新/旧（旧=无代码围栏高亮）~%")
   (format t "  /footer on|off 开/关底部常驻状态栏与输入栏~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
-  (format t "  /quit 或 /exit 退出~%"))
+  (format t "  /quit 或 /exit 退出（没有对话的空会话不会保留）~%"))
 
 (defun repl-command (line agent)
   (let* ((trim (clean-input-line line))
@@ -778,18 +849,34 @@
       ((string= cmd "/new")
        (repl-new-session agent))
       ((string= cmd "/sessions")
-       (repl-list-sessions))
+       ;; "/sessions all" also lists the checkpoint-only sessions, which are
+       ;; hidden by default because every REPL start creates one.
+       (repl-list-sessions (and rest (string-equal rest "all"))))
       ((string= cmd "/use")
        (if (and rest (plusp (length rest)))
-           ;; explicit pick: number / unique id prefix / full id
-           (let ((ids (sorted-session-ids)))
+           ;; explicit pick: number / unique id prefix / full id. Numbers refer
+           ;; to the DISPLAYED list (empty sessions hidden); a fully spelled id is
+           ;; also accepted against the complete list, so an empty session can
+           ;; still be opened deliberately.
+           (let* ((shown (sorted-session-ids))
+                  (ids (if (plusp (length shown))
+                           shown
+                           (sorted-session-ids t))))
              (multiple-value-bind (id status)
                  (agent-cl.session:resolve-session-choice rest ids)
-               (case status
-                 (:ok           (repl-use-session agent id))
-                 (:none         (format t "~&[session] 未找到匹配：~a~%" rest))
-                 (:ambiguous    (format t "~&[session] 前缀匹配到多个会话：~a~%" rest))
-                 (:out-of-range (format t "~&[session] 编号超出范围（1..~a）。~%" (length ids))))))
+               (cond
+                 ((eq status :ok) (repl-use-session agent id))
+                 ((eq status :ambiguous)
+                  (format t "~&[session] 前缀匹配到多个会话：~a~%" rest))
+                 ((eq status :out-of-range)
+                  (format t "~&[session] 编号超出范围（1..~a）。~%" (length ids)))
+                 (t
+                  (multiple-value-bind (id2 status2)
+                      (agent-cl.session:resolve-session-choice
+                       rest (sorted-session-ids t))
+                    (if (eq status2 :ok)
+                        (repl-use-session agent id2)
+                        (format t "~&[session] 未找到匹配：~a~%" rest)))))))
            ;; no argument: interactive picker
            (repl-use-interactive agent)))
       ((string= cmd "/plan")
@@ -862,7 +949,9 @@
                     (if (footer-active-p) "on" "off")))))
 
       ((or (string= cmd "/quit") (string= cmd "/exit"))
-       (uiop:quit 0))
+       ;; NOT (uiop:quit 0) here: a hard exit skips the unwind-protect that hands
+       ;; the terminal back and the cleanup that drops an unused session.
+       (setf *quit-requested* t))
       (t (format t "~&未知命令 ~a（/help 查看）~%" cmd)))))
 
 
@@ -1140,9 +1229,11 @@
            (footer-enable)
            (when (footer-active-p)
              (format t "~&[repl] 状态栏与输入栏已固定在底部（/footer off 关闭）。~%"))
-            (loop
-              ;; a resized terminal invalidates the pinned footer's geometry
-              (footer-refresh-geometry)
+            (loop until *quit-requested*
+                  ;; NB: an UNTIL clause must be followed by DO (or another loop
+                  ;; keyword) before any body form — a bare form there is a
+                  ;; macroexpansion error.
+                  do (footer-refresh-geometry)
               (if (footer-active-p)
                   (progn (footer-draw-status agent) (footer-draw-prompt))
                   (progn (render-status-bar agent)
@@ -1175,11 +1266,14 @@
                            (flush-tokens)
                            (format t "~&[repl] 已中断本轮（会话保留；在提示符处 Ctrl-C 退出）。~%")
                            (repl-persist-turn agent)))))))))
-      ;; always hand the terminal back, including on Ctrl-C
-      (footer-disable))
+      ;; always hand the terminal back, including on Ctrl-C, and drop the
+      ;; session if the user never actually talked in it
+      (footer-disable)
+      (cleanup-on-exit))
   ;; Ctrl-C 优雅退出（--script 下无调试器）
   (sb-sys:interactive-interrupt ()
     (footer-disable)
+    (cleanup-on-exit)
     (format t "~&[repl] 已退出（Ctrl-C）。~%")
     (finish-output)
     (uiop:quit 0)))
