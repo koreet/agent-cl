@@ -217,3 +217,30 @@
                (cond ((= (length hits) 1) (values (first hits) :ok))
                      ((> (length hits) 1)  (values nil :ambiguous))
                      (t                    (values nil :none))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; conversation replay for the UI (pure)
+;;; ---------------------------------------------------------------------------
+
+(defun conversation-entries (messages)
+  "Reduce replayed MESSAGES to displayable (role . content) pairs: keep only
+  :user / :assistant messages that have non-blank text (drop tool traffic and
+  assistant messages that carried only tool_calls). Pure."
+  (let ((out '()))
+    (dolist (m messages)
+      (let ((role (agent-cl.messages:msg-role m))
+            (text (agent-cl.messages:msg-content m)))
+        (when (and (member role '(:user :assistant))
+                   text
+                   (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                               text))))
+          (push (cons role text) out))))
+    (nreverse out)))
+
+(defun last-conversation-turns (messages n)
+  "The last N displayable (role . content) entries from MESSAGES (see
+  CONVERSATION-ENTRIES). N NIL means all. Pure."
+  (let ((all (conversation-entries messages)))
+    (if (and n (< n (length all)))
+        (subseq all (- (length all) n))
+        all)))

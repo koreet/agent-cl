@@ -540,8 +540,27 @@
             (:ambiguous   (format t "~&[session] 前缀匹配到多个会话，请用编号或完整 id。~%"))
             (:out-of-range (format t "~&[session] 编号超出范围（1..~a）。~%" (length ids)))))))))
 
+(defparameter *replay-count* 30
+  "How many recent user/assistant turns to echo back after switching sessions.")
+
+(defun replay-conversation (turns)
+  "Echo remembered TURNS ((role . content) ...) so the user can see the prior
+  conversation. Tool traffic is already filtered upstream; text goes through the
+  same markdown path as live output."
+  (when turns
+    (format t "~&── 历史回放（最近 ~a 条）──~%" (length turns))
+    (dolist (entry turns)
+      (let ((role (car entry)) (text (cdr entry)))
+        (format t "~&~a~%"
+                (if *color*
+                    (if (eq role :user) (ansi 34 "你 >") (ansi 36 "AI >"))
+                    (if (eq role :user) "你 >" "AI >")))
+        (render-md-text text)
+        (terpri)))
+    (format t "~&── 历史回放结束 ──~%")))
+
 (defun repl-use-session (agent id)
-  "切换到 ID 会话：先存当前会话，再载入目标历史续聊。"
+  "切换到 ID 会话：先存当前会话，再载入目标历史续聊，并回显最近若干轮。"
   (repl-persist-turn agent)   ; 存当前 agent 未落盘消息
   (let ((s (agent-cl.session:load-session id :directory (session-root))))
     (setf *repl-session* s)
@@ -549,7 +568,15 @@
       (setf (agent-cl.loop:agent-messages agent) history)
       (setf *persisted-count* (length history))
       (format t "~&[session] 已切换到 ~a（~a 条历史）~%"
-              id (length history)))))
+              id (length history))
+      ;; echo the recent conversation so the user sees what was said
+      (let ((turns (agent-cl.session:last-conversation-turns
+                    history *replay-count*)))
+        (replay-conversation turns)
+        (when (> (length (agent-cl.session:conversation-entries history))
+                 *replay-count*)
+          (format t "~&（更早的对话未显示；共 ~a 条）~%"
+                  (length (agent-cl.session:conversation-entries history))))))))
 
 (defun list-memory-keys ()
   (let* ((home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME")))

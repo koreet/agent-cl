@@ -136,3 +136,35 @@
       (is-equal nil id) (is-equal :none st))
     (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "zzz" ids)
       (is-equal nil id) (is-equal :none st))))
+
+
+;;;; conversation replay helpers (pure) ----------------------------------
+(deftest session-conversation-entries-filters-tools
+  (let ((msgs (list (agent-cl.messages:user-message "hi")
+                    (agent-cl.messages:assistant-message "hello")
+                    (agent-cl.messages:tool-result-message "c1" "tool out")
+                    (agent-cl.messages:user-message "again"))))
+    (let ((e (agent-cl.session:conversation-entries msgs)))
+      ;; tool message dropped -> 3 entries, roles preserved in order
+      (is-equal 3 (length e))
+      (is-equal '(:user :assistant :user) (mapcar #'car e))
+      (is-equal "hi" (cdr (first e))))))
+
+(deftest session-conversation-entries-drops-empty-assistant
+  ;; an assistant message that carried only tool_calls (blank text) is dropped
+  (let ((msgs (list (agent-cl.messages:user-message "q")
+                    (agent-cl.messages:assistant-message ""))))   ; no content
+    (is-equal 1 (length (agent-cl.session:conversation-entries msgs)))))
+
+(deftest session-last-turns-takes-tail
+  (let ((msgs (loop for i from 1 to 10
+                    collect (agent-cl.messages:user-message (format nil "m~a" i)))))
+    (let ((tail (agent-cl.session:last-conversation-turns msgs 3)))
+      (is-equal 3 (length tail))
+      (is-equal "m8"  (cdr (first tail)))
+      (is-equal "m10" (cdr (third tail))))))
+
+(deftest session-last-turns-nil-means-all
+  (let ((msgs (list (agent-cl.messages:user-message "a")
+                    (agent-cl.messages:user-message "b"))))
+    (is-equal 2 (length (agent-cl.session:last-conversation-turns msgs nil)))))

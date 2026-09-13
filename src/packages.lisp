@@ -194,7 +194,8 @@
    #:persist-message #:replayed-messages #:message->event #:event->message
    #:session-ids #:load-session #:session-first-user-text
    #:session-message-count #:session-last-ts
-   #:resolve-session-choice))
+   #:resolve-session-choice
+   #:conversation-entries #:last-conversation-turns))
 
 (defpackage #:agent-cl
   (:use #:cl)
