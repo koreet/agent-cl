@@ -176,7 +176,13 @@
    #:defmemory
    #:memory-spec #:memory-content #:memory-salience #:memory-linked-to
    #:memory-recall-when-form #:*default-decay-rate* #:decay-salience
-   #:memory-applicable-p #:recall-memories #:describe-memory))
+   #:memory-applicable-p #:recall-memories #:describe-memory
+   ;; metacognition (defintrospect)
+   #:defintrospect
+   #:introspect-spec #:introspect-signals #:introspect-threshold
+   #:introspect-on-low #:introspect-failure-patterns
+   #:introspect-confidence #:introspect-confident-p #:introspect-failure-kind
+   #:describe-introspect))
 
 (defpackage #:agent-cl.session
   (:use #:cl)
@@ -190,11 +196,11 @@
 (defpackage #:agent-cl
   (:use #:cl)
   (:import-from #:agent-cl.dsl #:defagent #:defpolicy #:defguard #:defdsl-tool
-                #:defcommand #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple #:defidentity #:defmemory)
+                #:defcommand #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple #:defidentity #:defmemory #:defintrospect)
   (:import-from #:agent-cl.loop #:make-agent #:run #:ask #:stop #:agent)
   (:export #:defagent #:defpolicy #:defguard #:defdsl-tool #:defcommand
            #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple #:defidentity
-           #:defmemory
+           #:defmemory #:defintrospect
            #:make-agent #:run #:ask #:stop #:agent
            #:*default-model* #:*default-base-url*))
 

@@ -51,6 +51,7 @@
    (:file "dsl/graph")
    (:file "dsl/identity")
    (:file "dsl/memory")
+   (:file "dsl/introspect")
    ;; ---- session ----
    (:file "session/store")
    ;; ---- markdown line classifier (pure, fenced-code aware) ----
@@ -82,4 +83,5 @@
    (:file "dsl-graph-tests")
    (:file "dsl-identity-tests")
    (:file "dsl-memory-tests")
+   (:file "dsl-introspect-tests")
    (:file "selfimprove-tests")))
