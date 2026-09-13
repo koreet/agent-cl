@@ -163,7 +163,11 @@
    #:principle-priority #:principle-statement #:principle-constrains
    #:principle-resolves-conflict-form #:all-principles
    #:max-principle-priority #:constitution-p #:change-principle-priority
-   #:resolve-principles #:describe-principle))
+   #:resolve-principles #:describe-principle
+   ;; dependency graph (reuse decl-refs)
+   #:decl-references #:decl-referenced-by #:decl-dependents #:impact-of
+   #:decl-internal-refs #:decl-external-refs #:dangling-refs
+   #:declared-name-p #:decl-any #:describe-impact))
 
 (defpackage #:agent-cl.session
   (:use #:cl)
