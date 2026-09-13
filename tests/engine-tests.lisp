@@ -407,6 +407,23 @@
     (is-equal :error status)
     (ok (search "exit" content))))
 
+(deftest shell-run-works-in-a-fresh-tree
+  "Regression: uiop opens the watchdog's redirection files at launch time, so
+  the output directory must exist BEFORE launch-program. When it was created
+  afterwards, a fresh clone (where .tools/ is gitignored) failed its very first
+  shell.run with 'Error opening .../watchdog-*.txt'."
+  (agent-cl.tools:register-builtin-tools)
+  (let ((tmp (merge-pathnames ".tools/tmp/" (uiop:getcwd))))
+    ;; simulate a fresh clone: remove the scratch dir the watchdog writes into
+    (when (uiop:directory-exists-p tmp)
+      (ignore-errors
+       (uiop:delete-directory-tree tmp :validate t :if-does-not-exist :ignore)))
+    (multiple-value-bind (content status)
+        (agent-cl.tools:call-tool "shell.run"
+                                  (list :CMD "echo fresh-tree-ok" :TIMEOUT 20))
+      (is-equal :ok status)
+      (ok (search "fresh-tree-ok" content)))))
+
 (deftest read-file-lenient-tolerates-gbk-bytes
   ;; Subprocess output on Windows may be GBK, not UTF-8; the watchdog must
   ;; never raise a stream decoding error on such files (regression for the

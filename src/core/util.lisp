@@ -155,8 +155,7 @@
         (uiop:run-program argv :output :string :error-output :string
                           :directory (namestring dir)
                           :ignore-error-status t)
-        (let* ((stamp (format nil "~d-~d" (get-universal-time)
-                              (random 100000)))
+        (let* ((stamp (agent-cl.core:uuid-string))
                (tmp-dir (uiop:ensure-directory-pathname
                          (merge-pathnames ".tools/tmp/" (uiop:getcwd))))
                (out-file (merge-pathnames
@@ -164,14 +163,18 @@
                (err-file (merge-pathnames
                           (format nil "watchdog-~a-err.txt" stamp) tmp-dir))
                (deadline (+ (get-internal-real-time)
-                            (round (* timeout internal-time-units-per-second))))
-               (proc (uiop:launch-program
-                      argv
-                      :output (namestring out-file)
-                      :error-output (namestring err-file)
-                      :directory (namestring dir))))
-          (ensure-directories-exist out-file)
-          (unwind-protect
+                            (round (* timeout internal-time-units-per-second)))))
+          ;; The redirection files are opened by UIOP *at launch time*, so the
+          ;; directory must exist BEFORE launch-program: otherwise a fresh clone
+          ;; (where .tools/ is gitignored and thus absent) fails its very first
+          ;; shell.run with "Error opening .../watchdog-*.txt".
+          (ensure-directories-exist tmp-dir)
+          (let ((proc (uiop:launch-program
+                       argv
+                       :output (namestring out-file)
+                       :error-output (namestring err-file)
+                       :directory (namestring dir))))
+            (unwind-protect
                (progn
                  (loop while (and (<= (get-internal-real-time) deadline)
                                   (ignore-errors (uiop:process-alive-p proc)))
@@ -204,7 +207,7 @@
             (when (ignore-errors (uiop:process-alive-p proc))
               (ignore-errors (uiop:terminate-process proc)))
             (ignore-errors (delete-file out-file))
-            (ignore-errors (delete-file err-file)))))))
+            (ignore-errors (delete-file err-file))))))))
 
 (defun format-token-count (n)
   "Compact token count for display: <1000 as-is, then 1.2k, then 1.2M.
