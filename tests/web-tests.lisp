@@ -66,3 +66,113 @@
     (is-equal 2000 (length (agent-cl.web::body-text s nil)))
     (is-equal 10 (length (agent-cl.web::body-text s 10)))
     (is-equal "" (agent-cl.web::body-text nil nil))))
+
+;;; ---------------------------------------------------------------------------
+;;; cost guards: cache + per-process budget
+;;;
+;;; Regression for a real incident: an agent fleet burned a whole Tavily quota
+;;; because every web.search was a billable request, with no cache and no cap.
+;;; These tests inject a counting stub so the logic is verified offline.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-search-stub ((counter-var) &body body)
+  "Run BODY with web.search's network call replaced by a counting stub that
+  returns one well-formed result, and a clean cache/budget. LET* is required:
+  the stub closes over COUNTER-VAR, which parallel LET would not have bound yet."
+  `(let* ((,counter-var 0)
+          (agent-cl.web:*search-fetcher*
+            (lambda (backend query max)
+              (declare (ignore backend max))
+              (incf ,counter-var)
+              (list (list :TITLE (format nil "R~a" ,counter-var)
+                          :URL (format nil "http://x/~a" ,counter-var)
+                          :CONTENT "snip"))))
+          (agent-cl.web:*web-search-budget* 20)
+          (agent-cl.web:*search-cache-ttl* 3600))
+     (agent-cl.web:reset-web-search-budget)
+     (agent-cl.web:clear-search-cache)
+     ,@body))
+
+(deftest web-search-cache-avoids-repeat-requests
+  (with-search-stub (calls)
+    (multiple-value-bind (c1 s1) (agent-cl.web:web-search
+                                  (list :QUERY "common lisp" :MAX-RESULTS 3) nil)
+      (is-equal :ok s1)
+      (ok (search "R1" c1) "first call hits the backend")
+      (is-equal 1 calls))
+    ;; identical query -> served from cache, no second billable request
+    (multiple-value-bind (c2 s2) (agent-cl.web:web-search
+                                  (list :QUERY "common lisp" :MAX-RESULTS 3) nil)
+      (is-equal :ok s2)
+      (ok (search "R1" c2))
+      (is-equal 1 calls)
+      (is-equal "R1" (subseq c2 0 (min 2 (length c2)))))
+    ;; different max-results is a different cache key -> one more request
+    (agent-cl.web:web-search (list :QUERY "common lisp" :MAX-RESULTS 5) nil)
+    (is-equal 2 calls)))
+
+(deftest web-search-budget-stops-spending
+  (with-search-stub (calls)
+    (let ((agent-cl.web:*web-search-budget* 2))
+      (agent-cl.web:reset-web-search-budget)
+      ;; two distinct queries consume the whole budget
+      (is-equal :ok (nth-value 1 (agent-cl.web:web-search (list :QUERY "q1") nil)))
+      (is-equal :ok (nth-value 1 (agent-cl.web:web-search (list :QUERY "q2") nil)))
+      (is-equal 2 calls)
+      (is-equal 0 (agent-cl.web:search-budget-left))
+      ;; third distinct query must be refused WITHOUT issuing a request
+      (multiple-value-bind (c3 s3) (agent-cl.web:web-search (list :QUERY "q3") nil)
+        (is-equal :error s3)
+        (ok (search "上限" c3) "explains the budget was hit")
+        (is-equal 2 calls) "no further billable request")
+      ;; a cached query still works for free even at zero budget
+      (multiple-value-bind (c4 s4) (agent-cl.web:web-search (list :QUERY "q1") nil)
+        (is-equal :ok s4)
+        (ok (search "R1" c4))
+        (is-equal 2 calls)))))
+
+(deftest web-search-budget-nil-means-unlimited
+  (with-search-stub (calls)
+    (let ((agent-cl.web:*web-search-budget* nil))
+      (agent-cl.web:reset-web-search-budget)
+      (dotimes (i 5)
+        (agent-cl.web:web-search (list :QUERY (format nil "unlimited-~a" i)) nil))
+      (is-equal 5 calls)
+      (ok (> (agent-cl.web:search-budget-left) 1000) "unlimited reports a huge remaining"))))
+
+(deftest web-search-disabled-cache-always-refetches
+  (with-search-stub (calls)
+    (let ((agent-cl.web:*search-cache-ttl* 0))
+      (agent-cl.web:clear-search-cache)
+      (agent-cl.web:web-search (list :QUERY "nocache" :MAX-RESULTS 1) nil)
+      (agent-cl.web:web-search (list :QUERY "nocache" :MAX-RESULTS 1) nil)
+      (is-equal 2 calls "ttl 0 disables caching"))))
+
+(deftest web-search-trips-breaker-on-quota-error
+  "A provider quota rejection (Tavily 432 'usage limit') must stop the process
+  from spending more: subsequent distinct queries are refused WITHOUT a request,
+  instead of hammering a dead endpoint."
+  (let* ((agent-cl.web:*web-search-budget* nil)   ; unlimited budget -> only the breaker can stop us
+         (agent-cl.web:*search-cache-ttl* 3600)
+         (requests 0)
+         (agent-cl.web:*search-fetcher*
+           (lambda (backend query max)
+             (declare (ignore backend query max))
+             (incf requests)
+             (error "web http 432: {\"detail\":{\"error\":\"This request exceeds your plan's set usage limit.\"}}"))))
+    (agent-cl.web:reset-web-search-budget)
+    (agent-cl.web:clear-search-cache)
+    ;; 1) the first call fails with a quota error -> breaker trips
+    (multiple-value-bind (c1 s1) (agent-cl.web:web-search (list :QUERY "q1") nil)
+      (is-equal :error s1)
+      (ok (search "熔断" c1) "tells the caller it tripped")
+      (is-equal 1 requests))
+    (ok agent-cl.web:*web-search-tripped* "breaker flag is set")
+    ;; 2) a NEW query must be refused with no further request
+    (multiple-value-bind (c2 s2) (agent-cl.web:web-search (list :QUERY "q2") nil)
+      (is-equal :error s2)
+      (ok (search "熔断" c2))
+      (is-equal 1 requests) "no second billable request")
+    ;; 3) resetting clears the breaker
+    (agent-cl.web:reset-web-search-budget)
+    (ok (not agent-cl.web:*web-search-tripped*) "reset clears the breaker")))

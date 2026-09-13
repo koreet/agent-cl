@@ -11,7 +11,11 @@
 (defpackage #:agent-cl.web
   (:use #:cl)
   (:export #:web-search #:ddg-fetch-results #:tavily-fetch-results
-           #:*tavily-key-file* #:tavily-key))
+           #:*tavily-key-file* #:tavily-key
+           ;; cost guards: result cache + per-process search budget
+           #:*web-search-budget* #:*web-search-calls* #:*search-cache-ttl*
+           #:*search-fetcher* #:*web-search-tripped*
+           #:search-budget-left #:reset-web-search-budget #:clear-search-cache))
 
 (in-package #:agent-cl.web)
 
@@ -242,6 +246,121 @@
                             (format o "~%    ~a"
                                     (subseq content 0 (min 300 (length content)))))))))
 
+;;; ---------------------------------------------------------------------------
+;;; Cost control: result cache + per-process budget
+;;;
+;;; Every web.search call is a REAL, BILLABLE Tavily request. An agent (or a
+;;; fleet of delegated child agents) can easily issue hundreds of them while
+;;; iterating, which drains a monthly quota. Two guards here:
+;;;   1. CACHE  — identical (backend, query, max-results) within TTL is served
+;;;      from memory and costs nothing;
+;;;   2. BUDGET — a hard cap on real network searches per process; once hit the
+;;;      tool returns a clear error instead of spending more quota.
+;;; Cache hits never count against the budget, and requests that fail before
+;;; leaving the process (e.g. no API key) do not count either.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *web-search-budget* 20
+  "Max REAL network searches per process. NIL = unlimited. Cache hits and
+  no-key/no-request failures do not count. Raise with reset-web-search-budget.")
+
+(defparameter *web-search-calls* 0
+  "Real network searches issued so far in this process.")
+
+(defparameter *search-cache-ttl* 3600
+  "Seconds a cached result set stays valid. 0 disables caching.")
+
+(defvar *search-cache* (make-hash-table :test 'equal)
+  "CACHE-KEY -> (universal-time . results).")
+
+(defvar *search-fetcher* nil
+  "Test seam: when bound to (lambda (backend query max) -> results), it replaces
+  the real network call so cache/budget logic can be verified offline.")
+
+(defun cache-key (backend query max)
+  (list backend query max))
+
+(defun cache-lookup (key)
+  "Cached results for KEY when still fresh, else NIL (expired entries drop)."
+  (let ((entry (gethash key *search-cache*)))
+    (when entry
+      (destructuring-bind (ts . results) entry
+        (if (and (plusp *search-cache-ttl*)
+                 (< (- (get-universal-time) ts) *search-cache-ttl*))
+            results
+            (progn (remhash key *search-cache*) nil))))))
+
+(defun cache-store (key results)
+  (when (plusp *search-cache-ttl*)
+    (setf (gethash key *search-cache*)
+          (cons (get-universal-time) results)))
+  results)
+
+(defun clear-search-cache ()
+  "Drop every cached result set (used by tests and by users who want fresh data)."
+  (clrhash *search-cache*))
+
+(defun search-budget-left ()
+  "Real searches still allowed in this process (a large number when unlimited)."
+  (if *web-search-budget*
+      (max 0 (- *web-search-budget* *web-search-calls*))
+      most-positive-fixnum))
+
+(defun reset-web-search-budget (&optional budget)
+  "Reset the call counter and clear a tripped breaker; set a new BUDGET when
+  supplied."
+  (setf *web-search-calls* 0)
+  (setf *web-search-tripped* nil)
+  (when budget (setf *web-search-budget* budget))
+  *web-search-budget*)
+
+(defvar *web-search-tripped* nil
+  "Set when the provider says the plan/quota is exhausted; further real
+  searches are refused until the counter is reset.")
+
+(defun quota-error-p (message)
+  "True when MESSAGE looks like a provider quota/rate-limit rejection, so we
+  trip the breaker instead of letting the agent hammer a dead endpoint."
+  (let ((m (string-downcase (or message ""))))
+    (or (search "432" m)
+        (search "429" m)
+        (search "usage limit" m)
+        (search "rate limit" m)
+        (search "quota" m)
+        (search "exceeds your plan" m))))
+
+(defun trip-search-breaker (message)
+  "Stop spending: mark the quota as exhausted and pin the budget to what has
+  already been used."
+  (setf *web-search-tripped* t)
+  (when *web-search-budget*
+    (setf *web-search-budget* *web-search-calls*))
+  message)
+
+(defun render-search-results (backend results)
+  "Backend-agnostic rendering of RESULTS into the agent-facing text."
+  (if (string-equal backend "ddg")
+      (format nil "~{~a - ~a~%~}"
+              (loop for (t1 . u) in results append (list t1 u)))
+      (format-results results)))
+
+(defun search-backend-ready-p (backend)
+  "True when BACKEND can actually issue a request (so we never count a call
+  that fails before leaving the process). A bound *SEARCH-FETCHER* stub counts
+  as ready: it stands in for the network in tests."
+  (if (string-equal backend "ddg")
+      t
+      (or *search-fetcher*
+          (and (tavily-key) t))))
+
+(defun call-search-backend (backend query max)
+  "Issue the real (billable) search through BACKEND, honoring the test seam."
+  (if *search-fetcher*
+      (funcall *search-fetcher* backend query max)
+      (if (string-equal backend "ddg")
+          (ddg-fetch-results query max)
+          (tavily-fetch-results query max))))
+
 (defun tavily-fetch-results (query max)
   "Query Tavily and return a list of plists (:TITLE :URL :CONTENT :SCORE).
   Signals a descriptive error when no key is configured or the call fails."
@@ -263,26 +382,51 @@
   "按 query 检索网页，返回至多 max_results 条「标题 - URL」(+ 摘要行)。
 
   Backend is Tavily (JSON, needs a key). Pass :backend \"ddg\" to use the
-  keyless DuckDuckGo HTML scraper instead."
+  keyless DuckDuckGo HTML scraper instead.
+
+  Cost guards: identical queries within *SEARCH-CACHE-TTL* are served from
+  cache, and at most *WEB-SEARCH-BUDGET* real requests are issued per process
+  (cache hits are free); exceeding the budget returns an error rather than
+  spending more quota."
   (declare (ignore ctx))
   (let* ((query (getf args :QUERY))
          (max (or (getf args :MAX-RESULTS) 5))
          (backend (or (getf args :BACKEND) "tavily")))
     (unless query
       (return-from web-search (values "missing :query" :error)))
-    (handler-case
-        (cond
-          ((string-equal backend "ddg")
-           (let ((links (ddg-fetch-results query max)))
-             (if links
-                 (values (format nil "~{~a - ~a~%~}"
-                                 (loop for (t1 . u) in links
-                                       append (list t1 u)))
-                         :ok)
-                 (values "没有找到相关结果" :error))))
-          (t
-           (let ((results (tavily-fetch-results query max)))
-             (if results
-                 (values (format-results results) :ok)
-                 (values "没有找到相关结果" :error)))))
-      (error (e) (values (format nil "检索失败: ~a" e) :error)))))
+    (let ((key (cache-key backend query max)))
+      ;; 1) cache first: same query within TTL costs nothing
+      (let ((cached (cache-lookup key)))
+        (when cached
+          (return-from web-search
+            (values (render-search-results backend cached) :ok))))
+      ;; 2a) quota already exhausted -> refuse immediately, no request at all
+      (when *web-search-tripped*
+        (return-from web-search
+          (values "web.search 已熔断：上一次调用返回额度/限流错误（如 Tavily 432 usage limit）。请升级套餐或稍后 reset-web-search-budget，本进程不再发起检索。"
+                  :error)))
+      ;; 2b) budget gate: refuse before spending any quota
+      (when (and (search-backend-ready-p backend)
+                 (zerop (search-budget-left)))
+        (return-from web-search
+          (values (format nil "web.search 已达本次运行上限（~a 次真实检索；缓存命中不计）。提升 agent-cl.web:*web-search-budget* 或 reset-web-search-budget 后继续。"
+                          *web-search-budget*)
+                  :error)))
+      ;; 3) real request (counted only when it actually goes out)
+      (handler-case
+          (let ((results (if (search-backend-ready-p backend)
+                             (progn (incf *web-search-calls*)
+                                    (call-search-backend backend query max))
+                             (call-search-backend backend query max))))
+            (if results
+                (values (render-search-results
+                         backend (cache-store key results))
+                        :ok)
+                (values "没有找到相关结果" :error)))
+        (error (e)
+          (let ((msg (format nil "~a" e)))
+            (if (quota-error-p msg)
+                (values (format nil "检索失败（已熔断，后续检索不再发出）: ~a"
+                                (trip-search-breaker msg))
+                        :error)
+                (values (format nil "检索失败: ~a" msg) :error))))))))
