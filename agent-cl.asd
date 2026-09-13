@@ -56,6 +56,8 @@
    (:file "session/store")
    ;; ---- markdown line classifier (pure, fenced-code aware) ----
    (:file "render/engine")
+   ;; ---- console footer geometry + escape sequences (pure; probe is soft) ----
+   (:file "render/terminal")
 
    ;; ---- self-improvement (safe, gate-guarded single-file patches) ----
    (:file "selfimprove/engine")))
@@ -75,6 +77,7 @@
    (:file "dsl-tests")
    (:file "session-tests")
    (:file "render-tests")
+   (:file "terminal-tests")
    (:file "dsl-contract-tests")
    (:file "dsl-audit-tests")
    (:file "dsl-principle-tests")

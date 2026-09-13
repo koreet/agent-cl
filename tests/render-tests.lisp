@@ -250,3 +250,34 @@
   (let ((rows (list '("A" "B") '("---" "---") '("1" "2"))))
     (let ((lines (agent-cl.render:format-table-block rows)))
       (is-equal 2 (length lines)))))
+
+;;;; agent activity nesting (pure) --------------------------------------
+;; The sub-agent display contract: top level (depth 0) is untouched so no
+;; existing output changes; each nesting level indents one step and prefixes
+;; a caller-supplied mark, so delegated (task.delegate) work is visually
+;; distinguishable from its parent. Pure: no terminal, no ANSI.
+
+(deftest render-agent-indent-scales-with-depth
+  (is-equal "" (agent-cl.render:agent-indent 0))
+  (is-equal "  " (agent-cl.render:agent-indent 1))
+  (is-equal "    " (agent-cl.render:agent-indent 2))
+  ;; negative depth is clamped, never crashes the renderer
+  (is-equal "" (agent-cl.render:agent-indent -3)))
+
+(deftest render-agent-activity-top-level-is-verbatim
+  ;; depth 0 must be byte-for-byte the old behaviour: no indent, no mark
+  (is-equal "[tool shell.run -> OK]"
+            (agent-cl.render:agent-activity-line 0 "[sub 1]" "[tool shell.run -> OK]")))
+
+(deftest render-agent-activity-subagent-is-indented-and-marked
+  (is-equal "  [sub 1] [tool code.exec -> OK]"
+            (agent-cl.render:agent-activity-line 1 "[sub 1]" "[tool code.exec -> OK]"))
+  ;; deeper nesting stacks indentation and keeps the mark
+  (is-equal "    [sub 2] step 1"
+            (agent-cl.render:agent-activity-line 2 "[sub 2]" "step 1")))
+
+(deftest render-agent-activity-mark-is-caller-supplied
+  ;; the layout layer is mark-agnostic: whatever the caller passes is drawn,
+  ;; followed by exactly one space before the text
+  (is-equal "  >> hi" (agent-cl.render:agent-activity-line 1 ">>" "hi"))
+  (is-equal "   hi" (agent-cl.render:agent-activity-line 1 "" "hi")))

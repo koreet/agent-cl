@@ -120,7 +120,8 @@
    #:agent-transport #:agent-model #:agent-tools #:agent-policy #:agent-messages #:agent-system
    #:agent-memory #:agent-max-steps #:agent-guard #:agent-usage-total #:agent-max-history #:agent-context-budget #:agent-compactor
    #:agent-usage-prompt #:agent-usage-completion
-   #:agent-cache-hit #:agent-cache-miss #:agent-cache-seen
+    #:agent-cache-hit #:agent-cache-miss #:agent-cache-seen
+    #:agent-depth
    #:policy
    #:make-policy #:policy-max-steps #:policy-temperature #:policy-max-tool-results
    #:policy-parallel-tools #:policy-allow-model-retry #:policy-max-tokens
@@ -239,5 +240,14 @@
    #:string-display-width #:wide-char-p #:pad-to-width
    #:parse-table-row #:separator-row-p #:format-table-block
    ;; heading decoration (pure): underline + SGR selection
-   #:*heading-rule-width* #:heading-rule #:heading-ansi #:heading-rule-color))
+   #:*heading-rule-width* #:heading-rule #:heading-ansi #:heading-rule-color
+   ;; agent activity nesting (pure): indent + marked line for sub-agents
+   #:*agent-indent-step* #:agent-indent #:agent-activity-line
+   ;; pinned bottom footer: escape sequences + geometry (pure)
+   #:csi #:set-scroll-region #:reset-scroll-region #:cursor-to #:erase-line
+   #:save-cursor #:restore-cursor
+   #:strip-ansi #:fit-to-width #:pad-ansi-line
+   #:*footer-height* #:footer-layout
+   ;; console capability probe (impure, fails soft: NIL = do not pin)
+   #:probe-console #:console-vt-enabled-p #:console-enable-vt))
 

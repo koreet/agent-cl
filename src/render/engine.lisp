@@ -367,3 +367,31 @@
                      (write-string bar o)))
           into out
           finally (return out))))
+
+;;; ---------------------------------------------------------------------------
+;;; agent activity nesting (pure)
+;;; ---------------------------------------------------------------------------
+;;; Sub-agent (task.delegate) work runs in its own session but its *display*
+;;; should read as nested under the parent, not interleaved with it. These two
+;;; helpers own that layout in the pure render layer so the rules are testable
+;;; without a terminal: DEPTH 0 is the top-level agent and is returned
+;;; untouched (existing output stays byte-for-byte identical); each deeper
+;;; level adds one indent step and draws a caller-supplied MARK (the REPL
+;;; passes a "[sub N]" tag) so delegated activity is unmistakably distinguished.
+
+(defparameter *agent-indent-step* 2
+  "Spaces of indentation added per sub-agent nesting level (pure layout knob).")
+
+(defun agent-indent (depth)
+  "Leading whitespace for agent activity nested DEPTH levels deep (pure).
+  Depth 0 (top level) yields no indentation."
+  (make-string (* *agent-indent-step* (max 0 depth)) :initial-element #\Space))
+
+(defun agent-activity-line (depth mark text)
+  "Compose one display line for agent activity at nesting DEPTH (pure).
+  DEPTH 0 returns TEXT verbatim, so top-level output is never altered;
+  DEPTH >= 1 prefixes the indent plus MARK, making a sub-agent's work read as
+  visually nested under its parent."
+  (if (<= depth 0)
+      text
+      (format nil "~a~a ~a" (agent-indent depth) mark text)))

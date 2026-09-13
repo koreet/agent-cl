@@ -256,11 +256,16 @@
                                   (agent-cl.tools:list-tools)
                                   (mapcar #'norm inherited))))))
         (let* ((child (agent-cl.loop:make-agent
-                       :transport (agent-cl.loop:agent-transport parent)
-                       :model model
-                       :tools child-tools
-                       :system "你是被父 agent 委派的子 agent。专注完成交给你的任务，只输出最终结论，不要复述中间过程。"
-                       :policy (agent-cl.loop:make-policy :max-steps max-steps)))
+                        ;; A child inherits the parents class and sits one level
+                        ;; deeper, so display hooks (the REPL printer) fire on it
+                        ;; and can be indented/marked as delegated work.
+                        :class (class-of parent)
+                        :depth (1+ (agent-cl.loop:agent-depth parent))
+                        :transport (agent-cl.loop:agent-transport parent)
+                        :model model
+                        :tools child-tools
+                        :system "你是被父 agent 委派的子 agent。专注完成交给你的任务，只输出最终结论，不要复述中间过程。"
+                        :policy (agent-cl.loop:make-policy :max-steps max-steps)))
                (r (agent-cl.loop:ask child task))
                (final (agent-cl.loop:final-content r)))
           (if (agent-cl.loop:done-p r)

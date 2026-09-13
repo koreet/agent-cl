@@ -34,31 +34,38 @@
                    when (and (plusp (length t2)) (digit-char-p (char t2 0)))
                      collect (step-body t2))))
 
-(defun run-step (agent s on-token)
-  "单步执行：流式优先，出错退化为一次性调用；两次都失败也返回错误文本，不让异常穿透。"
+(defun run-step (agent s)
+  "单步执行：一次性调用；失败也返回错误文本，不让异常穿透。
+  这里刻意 *不* 用流式：子 agent 的原文若经 on-token 直接流出，会和主答案
+  交叠；改为把结论交给 REPL 以缩进的 [sub agent N] 结论行统一展示。"
   (handler-case
-      (agent-cl.loop:ask agent s :stream t :on-token on-token)
-    (error ()
-      (handler-case
-          (agent-cl.loop:ask agent s)
-        (error (e)
-          (agent-cl.loop:guard-failed agent
-                                      (format nil "step error: ~a" e)))))))
+      (agent-cl.loop:ask agent s)
+    (error (e)
+      (agent-cl.loop:guard-failed agent
+                                  (format nil "step error: ~a" e)))))
 
-(defun step-child (agent s task on-token)
+(defun step-child (agent s task)
   "用一次性子 agent 执行单步，返回 turn-summary。子 agent 继承 transport/
   model/工具集但不共享 transcript——步骤执行的过程消息不会污染主会话历史。"
   (let* ((names (agent-cl.loop:agent-tools agent))
          (tools (if (eq names :all) (agent-cl.tools:list-tools) names))
          (child (agent-cl.loop:make-agent
+                 ;; Share the parent's class + one deeper level, so /plan step
+                 ;; execution shows up in the REPL as nested sub-agent activity
+                 ;; (steps / tools / conclusion) instead of silently swallowed.
+                 :class (class-of agent)
+                 :depth (1+ (agent-cl.loop:agent-depth agent))
                  :transport (agent-cl.loop:agent-transport agent)
                  :model (agent-cl.loop:agent-model agent)
                  :tools tools
                  :system "你是被 /plan 调用的步骤执行器。执行当前这一步并给出简短结论。"
                  :policy (agent-cl.loop:make-policy :max-steps 8))))
-    (run-step child (format nil "~a~%[原任务背景] ~a" s task) on-token)))
+    (run-step child (format nil "~a~%[原任务背景] ~a" s task))))
 
 (defun run-planned (agent task &optional (on-token nil))
+  ;; ON-TOKEN is kept for call compatibility; step children no longer stream, so
+  ;; their output is rendered as nested conclusions instead of raw deltas.
+  (declare (ignore on-token))
   (format t "~&[plan] 规划步骤...~%")
   (finish-output)
   (let* ((plan (one-shot agent
@@ -71,7 +78,7 @@
             for idx from 1
             do (format t "~&[plan] 执行 ~a/~a ~a~%" idx (length steps) s)
                (finish-output)
-               (let ((r (step-child agent s task on-token)))
+               (let ((r (step-child agent s task)))
                  (push (cond ((agent-cl.loop:done-p r)
                               (or (agent-cl.loop:final-content r) "(无输出)"))
                              (t (format nil "[步骤未完成: ~a]"

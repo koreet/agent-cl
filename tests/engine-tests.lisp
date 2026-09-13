@@ -629,3 +629,63 @@
          (a  (make-agent :transport tr :tools nil)))
     (agent-cl.loop:add-usage a nil)
     (is-equal 0 (agent-cl.loop:agent-usage-total a))))
+
+;;; ---------------------------------------------------------------------------
+;;; task.delegate display wiring: a sub-agent is the SAME class as its parent
+;;; and runs exactly one nesting level deeper. That is the mechanism letting a
+;;; front-end (the REPL printer) indent/mark delegated activity: its hooks fire
+;;; on the child too, and agent-depth tells it how deep to indent.
+;;; ---------------------------------------------------------------------------
+
+(defvar *delegate-events* nil
+  "Collector: (kind depth class-name) triples pushed by TRACE-AGENT hooks.")
+
+(defclass trace-agent (agent) ()
+  (:documentation "Stands in for a display-aware front-end subclass (repl-agent):
+   records the engine hooks so a test can observe which agent they fired on."))
+
+(defmethod on-step-start ((a trace-agent) step-ctx)
+  (declare (ignore step-ctx))
+  (push (list :step (agent-depth a) (class-name (class-of a))) *delegate-events*))
+
+(defmethod on-tool-result ((a trace-agent) tool-name result-plist)
+  (declare (ignore tool-name result-plist))
+  (push (list :tool (agent-depth a) (class-name (class-of a))) *delegate-events*))
+
+(defmethod on-turn-done ((a trace-agent) summary)
+  "Record the completion hook — the engine now fires it once per finished turn,
+   which is what lets a display layer print a sub-agent's conclusion."
+  (push (list :done (agent-depth a) (class-name (class-of a))
+              (and (done-p summary) (final-content summary)))
+        *delegate-events*))
+
+(deftest delegate-child-inherits-parent-class-and-depth
+  "The child is the parent's own class (so its display hooks fire on the child)
+   and sits one level deeper (so the parent can indent/mark it as delegated)."
+  (setf *delegate-events* nil)
+  (agent-cl.tools:register-builtin-tools)
+  (let* ((tr (make-mock-transport
+              :script (list
+                       (script-reply (reply-json "" (list (tc-json "c1" "task.delegate"
+                                                                  "{\"task\":\"算一下\",\"tools\":[]}"))))
+                       (script-reply (reply-json "42" nil))
+                       (script-reply (reply-json "子agent 告诉我 42" nil)))))
+         (agent (agent-cl.loop:make-agent :class 'trace-agent
+                                          :transport tr :tools '("task.delegate")
+                                          :policy (make-policy :max-steps 6))))
+    (agent-cl.loop:run agent "派个子 agent")
+    (let ((steps (remove-if-not (lambda (e) (eq (first e) :step)) *delegate-events*)))
+      (ok (find 0 steps :key #'second) "parent emits depth-0 steps")
+      (ok (find 1 steps :key #'second) "child emits depth-1 steps")
+      (ok (every (lambda (e) (eq (third e) 'trace-agent)) *delegate-events*)
+          "every hook fired on a trace-agent (child inherited the class)"))
+    ;; on-turn-done fires for both the child (depth 1, carrying its own
+    ;; conclusion) and the parent (depth 0, its final answer) — the wiring a
+    ;; "show the sub-agent's conclusion" display layer depends on.
+    (let* ((dones (remove-if-not (lambda (e) (eq (first e) :done)) *delegate-events*))
+           (child-done (find 1 dones :key #'second)))
+      (ok child-done "child on-turn-done fires at depth 1")
+      (ok (and child-done (search "42" (or (fourth child-done) "")))
+          "child on-turn-done carries its conclusion 42")
+      (ok (find 0 dones :key #'second) "parent on-turn-done fires at depth 0"))
+    (unregister-tool "task.delegate")))

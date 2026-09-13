@@ -89,11 +89,18 @@
    ;; prompt-cache hit/miss (NIL until a provider reports cache fields)
    (cache-hit        :initform 0 :accessor agent-cache-hit)
    (cache-miss       :initform 0 :accessor agent-cache-miss)
-   (cache-seen       :initform nil :accessor agent-cache-seen)))
+   (cache-seen       :initform nil :accessor agent-cache-seen)
+    ;; nesting: 0 = top-level agent; +1 for each task.delegate sub-agent, so a
+    ;; display layer can indent/mark delegated activity distinctly from its parent.
+    (depth            :initarg :depth :initform 0 :accessor agent-depth)))
 
 (defun make-agent (&key transport model (tools :all) policy messages memory system guard
-                       max-steps max-history context-budget compactor)
-  (make-instance 'agent
+                       max-steps max-history context-budget compactor
+                       (class 'agent) (depth 0))
+  ;; CLASS lets a caller build a subclass (e.g. a display-aware REPL agent,
+  ;; or a sub-agent that inherits its parent's class so the same hooks fire).
+  (make-instance class
+                 :depth depth
                  :transport transport
                  :model (or model agent-cl.llm:*default-model*)
                  :tools tools
@@ -393,13 +400,19 @@
                                        :done-p t :final-content content
                                        :steps step :tool-count tool-count
                                        :usage (agent-cl.llm:result-usage result))))))))))
-    (or final
-        (make-turn-summary :done-p nil
-                           :guard-reason (or guard-reason
-                                              (if (agent-stopped-p agent)
-                                                  :paused
-                                                  :max-steps))
-                           :steps step :tool-count tool-count))))
+    (let ((summary
+            (or final
+                (make-turn-summary :done-p nil
+                                   :guard-reason (or guard-reason
+                                                      (if (agent-stopped-p agent)
+                                                          :paused
+                                                          :max-steps))
+                                   :steps step :tool-count tool-count))))
+      ;; Fire the completion hook on the finished turn. This is the only place a
+      ;; caller learns the agent is done, so a display layer can print e.g. a
+      ;; sub-agent's conclusion the moment that (child) agent finishes.
+      (on-turn-done agent summary)
+      summary)))
 (defun call-model (agent params stream on-token)
   "One LLM round trip with automatic retry of transient transport failures
   (5xx/429, i.e. transport-error with RETRYABLE-P). Retry count is bounded by
