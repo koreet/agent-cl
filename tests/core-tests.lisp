@@ -49,3 +49,21 @@
     (write-file-string path "héllo")
     (is-equal "héllo" (read-file-string path))
     (ignore-errors (delete-file path))))
+
+
+;;;; format-token-count (status bar unit auto-scaling) -------------------
+(deftest format-token-count-small
+  (is-equal "0" (agent-cl.core:format-token-count 0))
+  (is-equal "999" (agent-cl.core:format-token-count 999)))
+
+(deftest format-token-count-thousands
+  (is-equal "1k" (agent-cl.core:format-token-count 1000))
+  (is-equal "1.8k" (agent-cl.core:format-token-count 1801))
+  (is-equal "12.3k" (agent-cl.core:format-token-count 12345)))
+
+(deftest format-token-count-millions
+  (is-equal "1M" (agent-cl.core:format-token-count 1000000))
+  (is-equal "2.5M" (agent-cl.core:format-token-count 2500000)))
+
+(deftest format-token-count-nonnumber
+  (is-equal "?" (agent-cl.core:format-token-count nil)))

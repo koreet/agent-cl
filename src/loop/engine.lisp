@@ -85,7 +85,11 @@
    (usage-total :initform 0 :accessor agent-usage-total)
    ;; prompt/completion split so the UI can show "↑in ↓out =total"
    (usage-prompt     :initform 0 :accessor agent-usage-prompt)
-   (usage-completion :initform 0 :accessor agent-usage-completion)))
+   (usage-completion :initform 0 :accessor agent-usage-completion)
+   ;; prompt-cache hit/miss (NIL until a provider reports cache fields)
+   (cache-hit        :initform 0 :accessor agent-cache-hit)
+   (cache-miss       :initform 0 :accessor agent-cache-miss)
+   (cache-seen       :initform nil :accessor agent-cache-seen)))
 
 (defun make-agent (&key transport model (tools :all) policy messages memory system guard
                        max-steps max-history context-budget compactor)
@@ -238,11 +242,18 @@
   Missing components count as 0; total is derived from the provider when given."
   (when usage
     (let ((p (or (agent-cl.llm:usage-prompt-tokens usage) 0))
-          (c (or (agent-cl.llm:usage-completion-tokens usage) 0)))
+          (c (or (agent-cl.llm:usage-completion-tokens usage) 0))
+          (h (agent-cl.llm:usage-cache-hit-tokens usage))
+          (m (agent-cl.llm:usage-cache-miss-tokens usage)))
       (incf (agent-usage-prompt agent) p)
       (incf (agent-usage-completion agent) c)
       (incf (agent-usage-total agent)
-            (or (agent-cl.llm:usage-total-tokens usage) (+ p c))))))
+            (or (agent-cl.llm:usage-total-tokens usage) (+ p c)))
+      ;; cache accounting is only meaningful once a provider reports it
+      (when (and h m)
+        (setf (agent-cache-seen agent) t)
+        (incf (agent-cache-hit agent) h)
+        (incf (agent-cache-miss agent) m)))))
 
 (defvar *extra-guards* nil
   "Alist (name . function) of user guard rules registered by defguard.")

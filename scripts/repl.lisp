@@ -705,20 +705,32 @@
         (concatenate 'string "~" (subseq cwd (length home)))
         cwd)))
 
+(defun cache-hit-rate (agent)
+  "Prompt-cache hit ratio in [0,1], or NIL when the provider never reported
+  cache fields (so the caller can omit the display rather than fake it)."
+  (when (agent-cl.loop:agent-cache-seen agent)
+    (let ((h (agent-cl.loop:agent-cache-hit agent))
+          (m (agent-cl.loop:agent-cache-miss agent)))
+      (when (plusp (+ h m)) (/ h (float (+ h m)))))))
+
 (defun render-status-bar (agent)
-  "Print a one-line status bar after a turn: model | token split | working dir.
-  Kept short and dim so it does not compete with the answer text."
-  (let ((model (agent-cl.loop:agent-model agent))
-        (pin   (agent-cl.loop:agent-usage-prompt agent))
-        (pout  (agent-cl.loop:agent-usage-completion agent))
-        (tot   (agent-cl.loop:agent-usage-total agent))
-        (dir   (current-workdir)))
-    (format t "~&  ~a ~a | ~a ~a ~a | ~a~%"
-            (ansi 90 "──")                       ; dim rule
+  "Print a one-line status bar: model | token split (auto-scaled) |
+  optional cache hit-rate | working dir. Shown with every prompt."
+  (let* ((model (agent-cl.loop:agent-model agent))
+         (pin   (agent-cl.loop:agent-usage-prompt agent))
+         (pout  (agent-cl.loop:agent-usage-completion agent))
+         (tot   (agent-cl.loop:agent-usage-total agent))
+         (rate  (cache-hit-rate agent))
+         (dir   (current-workdir))
+         (tk #'agent-cl.core:format-token-count))
+    (format t "~&  ~a ~a | ~a ~a ~a~@[ ~a~] | ~a~%"
+            (ansi 90 "──")                          ; dim rule
             (ansi 36 (format nil "~a" model))
-            (ansi 32 (format nil "^~a" pin))     ; prompt tokens (in)
-            (ansi 33 (format nil "v~a" pout))    ; completion tokens (out)
-            (ansi 90 (format nil "=~a tok" tot))
+            (ansi 32 (format nil "^~a" (funcall tk pin)))   ; prompt (in)
+            (ansi 33 (format nil "v~a" (funcall tk pout)))  ; completion (out)
+            (ansi 90 (format nil "=~a tok" (funcall tk tot)))
+            (when rate
+              (ansi 35 (format nil "cache ~d%" (round (* rate 100)))))
             (ansi 90 dir))))
 
 (defun ask-turn (agent line)

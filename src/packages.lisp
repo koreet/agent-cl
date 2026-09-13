@@ -40,7 +40,8 @@
    #:write-file-string
    #:shell-command
    #:read-file-lenient
-   #:run-program-with-timeout))
+   #:run-program-with-timeout
+   #:format-token-count))
 
 (defpackage #:agent-cl.messages
   (:use #:cl)
@@ -78,7 +79,8 @@
    #:stream-done-seen
    ;; --- wire codec ---
    #:encode-request-json #:encode-message-wire #:parse-chat-json
-   #:usage-prompt-tokens #:usage-completion-tokens #:usage-total-tokens))
+   #:usage-prompt-tokens #:usage-completion-tokens #:usage-total-tokens
+   #:usage-cache-hit-tokens #:usage-cache-miss-tokens))
 
 (defpackage #:agent-cl.schema
   (:use #:cl)
@@ -117,6 +119,7 @@
    #:agent-transport #:agent-model #:agent-tools #:agent-policy #:agent-messages #:agent-system
    #:agent-memory #:agent-max-steps #:agent-guard #:agent-usage-total #:agent-max-history #:agent-context-budget #:agent-compactor
    #:agent-usage-prompt #:agent-usage-completion
+   #:agent-cache-hit #:agent-cache-miss #:agent-cache-seen
    #:policy
    #:make-policy #:policy-max-steps #:policy-temperature #:policy-max-tool-results
    #:policy-parallel-tools #:policy-allow-model-retry #:policy-max-tokens

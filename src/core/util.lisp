@@ -205,3 +205,16 @@
               (ignore-errors (uiop:terminate-process proc)))
             (ignore-errors (delete-file out-file))
             (ignore-errors (delete-file err-file)))))))
+
+(defun format-token-count (n)
+  "Compact token count for display: <1000 as-is, then 1.2k, then 1.2M.
+  Rounds to one decimal; drops a trailing '.0'. Non-numbers -> \"?\". Pure."
+  (cond
+    ((not (numberp n)) "?")
+    ((< n 1000) (format nil "~d" n))
+    ((< n 1000000) (let ((v (/ (round (* n 10) 1000) 10.0)))
+                     (if (= v (floor v)) (format nil "~dk" (floor v))
+                         (format nil "~,1fk" v))))
+    (t (let ((v (/ (round (* n 10) 1000000) 10.0)))
+         (if (= v (floor v)) (format nil "~dM" (floor v))
+             (format nil "~,1fM" v))))))

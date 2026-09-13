@@ -102,14 +102,24 @@
 (defun usage-prompt-tokens (usage) (getf usage :prompt-tokens))
 (defun usage-completion-tokens (usage) (getf usage :completion-tokens))
 (defun usage-total-tokens (usage) (getf usage :total-tokens))
+(defun usage-cache-hit-tokens (usage) (getf usage :cache-hit))
+(defun usage-cache-miss-tokens (usage) (getf usage :cache-miss))
 
 (defun normalize-usage (wire-usage)
-  "wire usage plist (keys :PROMPT-TOKENS ...) -> normalized plist
-  (:prompt-tokens :completion-tokens :total-tokens)."
+  "Wire usage plist -> normalized plist. Always carries :prompt-tokens /
+  :completion-tokens / :total-tokens. Cache fields are BEST-EFFORT: providers
+  that expose prompt caching (e.g. DeepSeek) report prompt_cache_hit_tokens /
+  prompt_cache_miss_tokens; we accept a couple of spellings and store
+  :cache-hit / :cache-miss as NIL when absent, so callers can simply omit the
+  hit-rate display rather than show a fabricated number."
   (when wire-usage
     (list :prompt-tokens (getf wire-usage :PROMPT-TOKENS)
           :completion-tokens (getf wire-usage :COMPLETION-TOKENS)
-          :total-tokens (getf wire-usage :TOTAL-TOKENS))))
+          :total-tokens (getf wire-usage :TOTAL-TOKENS)
+          :cache-hit (or (getf wire-usage :PROMPT-CACHE-HIT-TOKENS)
+                         (getf wire-usage :CACHE-HIT-TOKENS))
+          :cache-miss (or (getf wire-usage :PROMPT-CACHE-MISS-TOKENS)
+                          (getf wire-usage :CACHE-MISS-TOKENS)))))
 
 (defun parse-tool-calls (wire-tool-calls)
   "Wire tool_calls array (list of plists) -> list of message:tool-call."
