@@ -21,6 +21,14 @@
     concatenate subseq symbol-name make-string))
 (defvar *dsl-max-steps* 500)
 (defvar *dsl-max-result-chars* 2000)
+;; Step counting alone does not bound a single form: (make-string 100000000) or
+;; (append huge huge) is ONE step. CAP the arguments so a whitelisted function
+;; cannot be used to allocate unbounded memory or spin for minutes.
+(defvar *dsl-max-integer* 1000000000000
+  "Largest integer magnitude accepted as an operator argument (1e12).")
+(defvar *dsl-max-sequence* 100000
+  "Largest total element count (list elements / string characters) of all
+  arguments passed to one operator call.")
 
 (defparameter *dsl-blacklist-names*
   '("EVAL" "APPLY" "FUNCALL" "SYMBOL-FUNCTION" "FDEFINITION" "MACROEXPAND"
@@ -62,6 +70,50 @@
       (let ((cl-sym (find-symbol (symbol-name sym) :cl)))
         (and cl-sym (fboundp cl-sym) (symbol-function cl-sym)))))
 
+(defun dsl-value-size (value limit)
+  "Approximate element count of VALUE (list elements, string/vector length),
+  giving up at LIMIT so this measurement can never itself be the bomb. Walks
+  lists with a step counter, so a circular list cannot hang the check."
+  (cond
+    ((or (stringp value) (vectorp value)) (length value))
+    ((consp value)
+     (let ((n 0) (tail value))
+       (loop while (and (consp tail) (< n limit))
+             do (incf n) (setf tail (cdr tail)))
+       n))
+    (t 1)))
+
+(defvar *dsl-size-argument-ops*
+  '(("MAKE-STRING" . 0) ("MAKE-LIST" . 0) ("MAKE-ARRAY" . 0) ("MAKE-SEQUENCE" . 1))
+  "Operators whose Nth argument is the SIZE of the object they allocate. Their
+  argument is a small integer, so the ordinary argument-size check cannot see the
+  result: (make-string 100000000) is one step, one tiny argument, and 100MB of
+  memory. Checked against *DSL-MAX-SEQUENCE* before the call.")
+
+(defun check-op-limits (op args)
+  "Refuse OP when its arguments are big enough to turn one whitelisted step into
+  an unbounded allocation. Signals dsl-error :limit."
+  (let ((total 0)
+        (op-name (and (symbolp op) (symbol-name op))))
+    (dolist (a args)
+      (when (and (integerp a) (> (abs a) *dsl-max-integer*))
+        (error 'agent-cl.core:dsl-error :kind :limit
+               :message (format nil "dsl 拒绝超大整数参数 ~a（上限 ~a）"
+                                a *dsl-max-integer*)))
+      (incf total (dsl-value-size a (- *dsl-max-sequence* total)))
+      (when (> total *dsl-max-sequence*)
+        (error 'agent-cl.core:dsl-error :kind :limit
+               :message (format nil "dsl 参数总量超过 ~a（~a）"
+                                *dsl-max-sequence* op))))
+    (let ((idx (cdr (assoc op-name *dsl-size-argument-ops* :test #'string-equal))))
+      (when idx
+        (let ((n (nth idx args)))
+          (when (and (integerp n) (> n *dsl-max-sequence*))
+            (error 'agent-cl.core:dsl-error :kind :limit
+                   :message (format nil "dsl 拒绝 ~a 分配 ~a （上限 ~a）"
+                                    op-name n *dsl-max-sequence*)))))))
+  t)
+
 (defun interp (form)
   (when (> (incf *dsl-steps*) *dsl-max-steps*)
     (error 'agent-cl.core:dsl-error :kind :step-limit
@@ -88,9 +140,11 @@
                 (setf result (interp sub)))
               result))
            ((allowed-symbol-p op)
-            (let ((fn (resolve-fn op)))
+            (let* ((fn (resolve-fn op))
+                   (args (mapcar #'interp (rest form))))
               (unless fn (dsl-denied form))
-              (apply fn (mapcar #'interp (rest form)))))
+              (check-op-limits op args)
+              (apply fn args)))
            (t (dsl-denied form)))))))
 
 (defun dsl-eval-safe (form)
@@ -98,18 +152,21 @@
   of the result (bounded). Signals dsl-error when disabled or denied."
   (unless (sandbox-mode-enabled-p)
     (dsl-disabled))
-  (let ((*dsl-steps* 0)
-        (result (interp form)))
-    (let ((text (etypecase result
-                  (string result)
-                  (number (princ-to-string result))
-                  (symbol (princ-to-string result))
-                  (list (prin1-to-string result))
-                  (null "nil")
-                  (t (princ-to-string result)))))
-      (when (> (length text) *dsl-max-result-chars*)
-        (setf text (subseq text 0 *dsl-max-result-chars*)))
-      text)))
+  ;; LET*, not LET: with parallel bindings RESULT was computed while *DSL-STEPS*
+  ;; still held the caller's value, so the per-call step counter was never
+  ;; actually reset (the limit leaked across calls) — the reset must bind first.
+  (let* ((*dsl-steps* 0)
+         (result (interp form))
+         (text (etypecase result
+                 (null "nil")
+                 (string result)
+                 (number (princ-to-string result))
+                 (symbol (princ-to-string result))
+                 (list (prin1-to-string result))
+                 (t (princ-to-string result)))))
+    (when (> (length text) *dsl-max-result-chars*)
+      (setf text (subseq text 0 *dsl-max-result-chars*)))
+    text))
 
 (defmacro with-dsl-sandbox (options &body body)
   "Enable the interpreter for BODY under an explicit policy.
@@ -118,12 +175,18 @@
   (let ((mode (or (getf options :mode) :interpreter))
         (wl (getf options :whitelist))
         (ms (getf options :max-steps))
-        (mrc (getf options :max-result-chars)))
+        (mrc (getf options :max-result-chars))
+        (mint (getf options :max-integer))
+        (mseq (getf options :max-sequence)))
     `(let ((agent-cl.dsl:*dsl-execution-mode* ,mode)
            (agent-cl.dsl:*dsl-command-whitelist*
             (or ,wl agent-cl.dsl:*dsl-command-whitelist*))
            (agent-cl.dsl:*dsl-max-steps*
             (or ,ms agent-cl.dsl:*dsl-max-steps*))
            (agent-cl.dsl:*dsl-max-result-chars*
-            (or ,mrc agent-cl.dsl:*dsl-max-result-chars*)))
+            (or ,mrc agent-cl.dsl:*dsl-max-result-chars*))
+           (agent-cl.dsl:*dsl-max-integer*
+            (or ,mint agent-cl.dsl:*dsl-max-integer*))
+           (agent-cl.dsl:*dsl-max-sequence*
+            (or ,mseq agent-cl.dsl:*dsl-max-sequence*)))
        ,@body)))

@@ -76,6 +76,7 @@
    (:file "sse-tests")
    (:file "engine-tests")
    (:file "dsl-tests")
+   (:file "dsl-hardening-tests")
    (:file "session-tests")
    (:file "render-tests")
    (:file "web-tests")

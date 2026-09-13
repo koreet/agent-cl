@@ -263,17 +263,132 @@
         (incf (agent-cache-miss agent) m)))))
 
 (defvar *extra-guards* nil
-  "Alist (name . function) of user guard rules registered by defguard.")
+  "Alist (name . function) of user guard rules registered by defguard. Each
+  function receives the agent and returns a reason string (trip) or NIL (pass).")
 
 (defun register-guard (name fn)
-  (pushnew (cons name fn) *extra-guards* :test (lambda (a b) (equal (car a) (car b))))
-  name)
+  "Register (or REPLACE) an extra guard rule NAME -> FN.
+  Re-registration must take effect: DEFGUARD redefines the Lisp function, and a
+  stale entry kept by PUSHNEW would silently keep running the PREVIOUS
+  definition — the guard would appear to accept a fix that never loaded."
+  (let ((key (if (stringp name) name (string-downcase (string name))))
+        (entry (assoc (if (stringp name) name (string-downcase (string name)))
+                      *extra-guards* :test #'equal)))
+    (if entry
+        (setf (cdr entry) fn)
+        (push (cons key fn) *extra-guards*))
+    key))
+
+(defun unregister-guard (name)
+  "Drop the guard rule called NAME. Returns T when something was removed."
+  (let* ((key (if (stringp name) name (string-downcase (string name))))
+         (before (length *extra-guards*)))
+    (setf *extra-guards* (remove key *extra-guards*
+                                 :key #'car :test #'equal))
+    (> before (length *extra-guards*))))
+
+(defun clear-guards ()
+  "Remove every registered extra guard rule."
+  (setf *extra-guards* nil))
+
+(defun guard-rule-names ()
+  (mapcar #'car *extra-guards*))
+
+(defun run-guard-rule (rule-fn agent label)
+  "Call RULE-FN on AGENT, returning a reason string or NIL.
+  A rule that RAISES is treated as a TRIP, not as a pass and not as a crash:
+  a broken guard must fail closed, and an exception escaping here would abort
+  the whole run through a path the caller cannot interpret."
+  (handler-case
+      (let ((reason (funcall rule-fn agent)))
+        (when reason
+          (if (stringp reason) reason (princ-to-string reason))))
+    (error (e)
+      (format nil "guard ~a 抛错（按阻断处理）: ~a" label e))))
 
 (defun check-extra-guards (agent)
-  "Run user guard rules; return the first reason string or NIL."
-  (dolist (entry *extra-guards*)
-    (let ((reason (funcall (cdr entry) agent)))
-      (when reason (return reason)))))
+  "Run the agent's own :guard rules plus every registered extra guard rule;
+  returns the first reason string or NIL."
+  (let ((own (agent-guard agent)))
+    (when own
+      (let ((fns (cond ((functionp own) (list own))
+                       ((and (symbolp own) (fboundp own)) (list own))
+                       ((listp own) own)
+                       (t nil))))
+        (dolist (fn fns)
+          (let ((reason (run-guard-rule fn agent "agent :guard")))
+            (when reason (return-from check-extra-guards reason))))))
+    (dolist (entry *extra-guards*)
+      (let ((reason (run-guard-rule (cdr entry) agent (car entry))))
+        (when reason (return reason))))))
+
+;; ---------------------------------------------------------------------------
+;; pre-execution tool guards (audit rules that must fire BEFORE a tool runs)
+;; ---------------------------------------------------------------------------
+
+(defvar *tool-guards* nil
+  "Alist (TOOL-NAME . (FN . PLIST)) of rules consulted BEFORE a tool executes.
+  TOOL-NAME is a registry name, or the wildcard \"any\"/\"*\" for every tool.
+  This is the preventive half of the audit layer: a global guard is only
+  consulted at the top of a step, i.e. after the offending tool has already
+  run, which is too late to refuse a write.")
+
+(defun tool-guard-wildcard-p (name)
+  (member (string-downcase (string name)) '("any" "*" "all") :test #'string=))
+
+(defun register-tool-guard (tool-name fn &key (on-violation :block) name)
+  "Register FN as a pre-execution rule for TOOL-NAME. FN is called as
+  (FN AGENT TOOL-NAME ARGS-PLIST) and returns a reason string or NIL.
+  ON-VIOLATION is :block (refuse the call) or :warn/:report (run it, but
+  annotate the result). Returns the normalized tool name."
+  (let* ((key (if (tool-guard-wildcard-p tool-name)
+                  "any"
+                  (string-downcase (string tool-name))))
+         (entry (assoc key *tool-guards* :test #'string=)))
+    (if entry
+        (setf (cdr entry) (list fn :on-violation on-violation :name name))
+        (push (cons key (list fn :on-violation on-violation :name name))
+              *tool-guards*))
+    key))
+
+(defun unregister-tool-guard (tool-name)
+  (let* ((key (if (tool-guard-wildcard-p tool-name)
+                  "any"
+                  (string-downcase (string tool-name))))
+         (before (length *tool-guards*)))
+    (setf *tool-guards* (remove key *tool-guards* :key #'car :test #'string=))
+    (> before (length *tool-guards*))))
+
+(defun clear-tool-guards ()
+  (setf *tool-guards* nil))
+
+(defun tool-guard-rules-for (tool-name)
+  "Every rule that applies to TOOL-NAME: exact matches first, then wildcards."
+  (let ((key (string-downcase (string tool-name))))
+    (append (remove-if-not (lambda (e) (string= (car e) key)) *tool-guards*)
+            (remove-if-not (lambda (e) (string= (car e) "any")) *tool-guards*))))
+
+(defun tool-guard-decision (agent tool-name args)
+  "Consult the pre-execution rules for TOOL-NAME.
+  Returns (values ACTION REASON RULE-NAME) where ACTION is :allow, :warn or
+  :block. A rule that raises blocks (fail closed)."
+  (let ((worst :allow) (worst-reason nil) (worst-name nil))
+    (dolist (entry (tool-guard-rules-for tool-name))
+      (let* ((fn (second entry))
+             (opts (cddr entry))
+             (rule-name (or (getf opts :name) (car entry)))
+             (reason (handler-case (funcall fn agent tool-name args)
+                       (error (e)
+                         (format nil "规则抛错（按阻断处理）: ~a" e)))))
+        (when reason
+          (let* ((reason (if (stringp reason) reason (princ-to-string reason)))
+                 (action (if (member (getf opts :on-violation) '(:warn :report))
+                             :warn
+                             :block)))
+            ;; :block outranks :warn regardless of registration order
+            (when (or (eq action :block) (eq worst :allow))
+              (setf worst action worst-reason reason worst-name rule-name))))))
+    (values worst worst-reason worst-name)))
 
 (defun guard-violation-p (agent)
   "Return a guard reason string if any configured limit is hit, else NIL."
@@ -285,14 +400,28 @@
 (defun dispatch-tool-call (agent tc policy)
   "Validate + execute one tool call; returns (values content status).
   AGENT is passed as the tool context so tools (task.delegate etc.) can spawn
-  child agents that inherit the same transport/credentials."
+  child agents that inherit the same transport/credentials.
+  Pre-execution audit rules (*TOOL-GUARDS*) run BEFORE the tool: a blocking
+  rule refuses the call outright, which is the only way an audit can prevent a
+  write rather than report it afterwards."
   (let* ((name (agent-cl.messages:tool-call-name tc)))
     (handler-case
         (let ((args (agent-cl.messages:tool-call-arguments-plist tc)))
-          (multiple-value-bind (content status)
-              (agent-cl.tools:call-tool name args agent)
-            (values (truncate-content content (policy-max-tool-results policy))
-                    status)))
+          (multiple-value-bind (action reason rule) (tool-guard-decision agent name args)
+            (cond
+              ((eq action :block)
+               (values (format nil "[审计规则 ~a 拒绝执行 ~a] ~a" rule name reason)
+                       :error))
+              (t
+               (multiple-value-bind (content status)
+                   (agent-cl.tools:call-tool name args agent)
+                 (let ((content (truncate-content content
+                                                  (policy-max-tool-results policy))))
+                   (values (if (eq action :warn)
+                               (format nil "[审计规则 ~a 告警] ~a~%~a"
+                                       rule reason content)
+                               content)
+                           status)))))))
       (error (e)
         ;; A malformed arguments JSON (truncated stream, model hallucination)
         ;; must not crash the whole run; surface it as a tool error result so

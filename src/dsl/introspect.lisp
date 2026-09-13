@@ -17,9 +17,21 @@
       (let ((key (first cl)) (val (rest cl)))
         (case key
           (:based-on
-           ;; accept (:based-on (sig1 sig2 ...)) or (:based-on sig1 sig2 ...)
-           (let ((sigs (if (and (= (length val) 1) (listp (first val)))
-                           (first val) val)))
+           ;; A signal is a predicate FORM. Accepted shapes:
+           ;;   (:based-on (form1) (form2))      - several forms
+           ;;   (:based-on (form1))              - one form, still wrapped
+           ;;   (:based-on ((form1) (form2)))    - one wrapped list of forms
+           ;; The old unwrapping rule ("one element that is a list -> take it")
+           ;; turned (:based-on (has-file-p)) into the SYMBOL has-file-p, so
+           ;; INTROSPECT-CONFIDENCE called LENGTH on a symbol and errored: a
+           ;; single-signal declaration was unusable.
+           (let* ((sigs (cond
+                          ((and (rest val) (every #'consp val)) val)
+                          ((and (null (rest val))
+                                (consp (first val))
+                                (every #'consp (first val)))
+                           (first val))
+                          (t val))))
              (setf spec (append spec (list :based-on (copy-list sigs))))))
           (:threshold
            (unless (numberp (first val))
@@ -65,9 +77,10 @@
 
 (defun introspect-confidence (name)
   "Confidence in [0,1] = fraction of :based-on signal forms that hold locally.
-  NIL if NAME is not an introspect declaration. No LLM involvement."
+  NIL if NAME is not an introspect declaration or declares no usable signals.
+  No LLM involvement."
   (let ((sigs (introspect-signals name)))
-    (when sigs
+    (when (and sigs (listp sigs))
       (let ((n (length sigs))
             (hit (count-if #'eval-local-predicate sigs)))
         (if (zerop n) 1.0 (coerce (/ hit n) 'single-float))))))

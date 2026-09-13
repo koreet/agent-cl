@@ -132,6 +132,10 @@
    #:add-usage
    #:guard-failed
    #:register-guard #:check-extra-guards #:*extra-guards*
+   #:unregister-guard #:clear-guards #:guard-rule-names
+   ;; pre-execution tool guards (preventive audit rules)
+   #:*tool-guards* #:register-tool-guard #:unregister-tool-guard
+   #:clear-tool-guards #:tool-guard-decision #:tool-guard-rules-for
    ;; CLOS extension hooks
    #:on-step-start #:on-tool-result #:on-turn-done #:before-llm-call #:choose-messages
    ;; results
@@ -147,10 +151,12 @@
    #:defdsl-tool #:defcommand #:defdsl-package #:defschema
    ;; agent instruction DSL (L1)
    #:defagent #:defpolicy #:defguard
+   #:find-policy #:register-policy #:list-policy-names #:clear-policies
    ;; schema generation bridge
    #:schema->json-schema #:dsl-tool-schema #:find-schema #:parse-schema-decl
    ;; safe evaluation (D2: disabled by default)
    #:*dsl-execution-mode* #:*dsl-command-whitelist* #:*dsl-max-steps* #:*dsl-max-result-chars*
+   #:*dsl-max-integer* #:*dsl-max-sequence*
    #:dsl-eval-safe
    #:with-dsl-sandbox
    ;; declaration metadata + reflection (dsl-contract-plan §B1)
@@ -158,21 +164,25 @@
    #:decl-name #:decl-kind #:decl-spec #:decl-refs #:decl-source #:decl-version
    #:make-declaration #:register-declaration #:find-declaration
    #:unregister-declaration #:all-declarations #:describe-declaration
+   #:clear-declarations #:declaration-spec #:declaration-refs
    ;; executable goal contract (dsl-contract-plan §B2)
    #:defgoal
    #:goal-spec #:goal-intent #:goal-subgoals #:goal-budget
    #:goal-preconditions #:goal-done-when-form #:goal-retry-limit
    #:goal-done-p #:goal-preconditions-met-p
    #:eval-local-predicate
+   #:last-goal-predicate-error #:clear-goal-predicate-error
    #:run-goal #:subgoal-task-text #:goal-completed-p   ; goal-driven execution
    ;; executable audit rules (dsl-contract-plan milestone i)
    #:defaudit
    #:audit-applies-to #:audit-on-violation #:audit-evidence #:describe-audit
+   #:audit-spec #:audit-intent #:audit-preventive-p
    ;; principles + constitution (dsl-contract-plan milestone ii)
    #:defprinciple
    #:principle-priority #:principle-statement #:principle-constrains
    #:principle-resolves-conflict-form #:all-principles
    #:max-principle-priority #:constitution-p #:change-principle-priority
+   #:principle-constitutional-p #:note-principle-registered
    #:resolve-principles #:describe-principle
    ;; dependency graph (reuse decl-refs)
    #:decl-references #:decl-referenced-by #:decl-dependents #:impact-of

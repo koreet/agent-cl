@@ -303,6 +303,10 @@
   "Drop every cached result set (used by tests and by users who want fresh data)."
   (clrhash *search-cache*))
 
+(defvar *web-search-tripped* nil
+  "Set when the provider says the plan/quota is exhausted; further real
+  searches are refused until the counter is reset.")
+
 (defun search-budget-left ()
   "Real searches still allowed in this process (a large number when unlimited)."
   (if *web-search-budget*
@@ -364,10 +368,6 @@
   (clrhash *child-search-usage*)
   (when budget (setf *child-search-budget* budget))
   *child-search-budget*)
-
-(defvar *web-search-tripped* nil
-  "Set when the provider says the plan/quota is exhausted; further real
-  searches are refused until the counter is reset.")
 
 (defun quota-error-p (message)
   "True when MESSAGE looks like a provider quota/rate-limit rejection, so we

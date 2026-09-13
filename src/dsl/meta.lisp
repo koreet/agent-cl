@@ -20,10 +20,26 @@
 (defvar *declarations* (make-hash-table :test 'equal)
   "name-string -> dsl-declaration. Equal-hash like *SCHEMAS* so string names work.")
 
+(defun decl-name-key (name)
+  "Normalized lookup key for NAME. Symbols keep their PACKAGE: without it,
+  PKG-A::RULE and PKG-B::RULE collapsed onto the same key, so a declaration in
+  one package silently replaced the identically-named one in another. Strings
+  and other designators keep the old bare-name behavior (that is how callers
+  look up declarations they only know by name)."
+  (cond
+    ((symbolp name)
+     (let ((pkg (symbol-package name)))
+       (if pkg
+           (format nil "~a::~a" (string-downcase (package-name pkg))
+                   (string-downcase (symbol-name name)))
+           (string-downcase (symbol-name name)))))
+    ((stringp name) (string-downcase name))
+    (t (string-downcase (princ-to-string name)))))
+
 (defun decl-key (name kind)
-  "Declarations are keyed by KIND + NAME so a :goal and an :audit may share a
-  name without clobbering each other."
-  (format nil "~(~a~)/~(~a~)" kind name))
+  "Declarations are keyed by KIND + PACKAGE-QUALIFIED NAME so a :goal and an
+  :audit may share a name, and two packages may declare the same name."
+  (format nil "~(~a~)/~a" kind (decl-name-key name)))
 
 (defun name-string (name)
   (if (stringp name) name (string-downcase (symbol-name name))))
@@ -44,6 +60,29 @@
 
 (defun unregister-declaration (name kind)
   (remhash (decl-key name kind) *declarations*))
+
+(defun clear-declarations (&optional kind)
+  "Drop every declaration (or every declaration of KIND). Returns how many were
+  removed. Tests and re-loads need this: declarations live in a global table, so
+  without a reset path a rule from a previous session leaks into the next."
+  (if kind
+      (let ((n 0))
+        (dolist (d (all-declarations kind))
+          (remhash (decl-key (decl-name d) (decl-kind d)) *declarations*)
+          (incf n))
+        n)
+      (let ((n (hash-table-count *declarations*)))
+        (clrhash *declarations*)
+        n)))
+
+(defun declaration-spec (name kind)
+  "SPEC plist of (NAME,KIND), or NIL when no such declaration exists."
+  (let ((d (find-declaration name kind)))
+    (and d (decl-spec d))))
+
+(defun declaration-refs (name kind)
+  (let ((d (find-declaration name kind)))
+    (and d (decl-refs d))))
 
 (defun all-declarations (&optional kind)
   "All declarations (optionally of one KIND), ordered by name."
