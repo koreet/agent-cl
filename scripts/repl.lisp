@@ -553,8 +553,8 @@
       (let ((role (car entry)) (text (cdr entry)))
         (format t "~&~a~%"
                 (if *color*
-                    (if (eq role :user) (ansi 34 "你 >") (ansi 36 "AI >"))
-                    (if (eq role :user) "你 >" "AI >")))
+                    (if (eq role :user) (ansi 34 "CL-USER>") (ansi 36 "AGENT>"))
+                    (if (eq role :user) "CL-USER>" "AGENT>")))
         (render-md-text text)
         (terpri)))
     (format t "~&── 历史回放结束 ──~%")))
@@ -743,8 +743,7 @@
                                (agent-cl.loop:guard-reason summary))))
                (error (e2)
                  (format t "~&agent> [error] ~a~%" e2))))))
-    ;; 每轮结束：打印状态栏（模型 / token / 工作路径），并持久化本轮消息
-    (render-status-bar agent)
+    ;; 每轮结束：持久化本轮消息。状态栏由主循环在提示符处常驻打印，这里不再打。
     (repl-persist-turn agent)))
 
 ;; ---------------------------------------------------------------------------
@@ -757,7 +756,9 @@
       (format t "~&Agent-CL REPL — 输入任务；/help 查看命令；/quit 退出；Ctrl-C 中断。~%")
       (format t "流式输出 + Markdown 着色已启用（/color off 关闭）。~%")
       (loop
-        (format t "~&you> ")
+        ;; persistent status bar: shown with every prompt, not just after a turn
+        (render-status-bar agent)
+        (format t "~&CL-USER> ")
         (finish-output)
         (let ((line (read-line *standard-input* nil :eof)))
           (cond
