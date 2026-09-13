@@ -7,9 +7,20 @@
 (in-package #:agent-cl.core)
 
 (defparameter *log-level* :info)
-(defparameter *log-output* *error-output*)
 
-(defparameter *log-levels* '(:trace 0 :debug 1 :info 2 :warn 3 :error 4))
+(defparameter *log-output* nil
+  "Stream log messages go to. NIL (the default) means: use *ERROR-OUTPUT* AS IT
+  IS WHEN THE MESSAGE IS WRITTEN*. Caching the load-time value meant a caller who
+  later rebound *ERROR-OUTPUT* (the REPL does) still had logs written to the
+  original stream. Set this to a stream to pin logging explicitly.")
+
+(defun log-stream ()
+  (or *log-output* *error-output*))
+
+;; An ALIST, not a plist: LEVEL-CHECK used to look levels up with ASSOC over a
+;; plist, which returns the KEY symbol itself, and (CDR :trace) then signalled
+;; "The value :TRACE is not of type LIST" — i.e. every log call raised.
+(defparameter *log-levels* '((:trace . 0) (:debug . 1) (:info . 2) (:warn . 3) (:error . 4)))
 
 (defun log-enabled-p (level)
   (>= (or (cdr (assoc level *log-levels*)) 1)
@@ -17,11 +28,12 @@
 
 (defun log-message (level fmt &rest args)
   (when (log-enabled-p level)
-    (format *log-output* "~&[~a] ~a ~a~%"
-            (string-downcase (symbol-name level))
-            (now-iso8601)
-            (apply #'format nil fmt args))
-    (finish-output *log-output*)))
+    (let ((out (log-stream)))
+      (format out "~&[~a] ~a ~a~%"
+              (string-downcase (symbol-name level))
+              (now-iso8601)
+              (apply #'format nil fmt args))
+      (finish-output out))))
 
 (defmacro define-log-fn (name level)
   `(defun ,name (fmt &rest args)

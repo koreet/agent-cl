@@ -122,11 +122,14 @@
                           (getf wire-usage :CACHE-MISS-TOKENS)))))
 
 (defun parse-tool-calls (wire-tool-calls)
-  "Wire tool_calls array (list of plists) -> list of message:tool-call."
+  "Wire tool_calls array (list of plists) -> list of message:tool-call.
+  Ids are synthesized when the provider omits them: the wire contract requires
+  every tool result to name the call it answers, and NIL is not a usable id."
   (loop for tc in wire-tool-calls
+        for i from 0
         for fn = (getf tc :FUNCTION)
         collect (agent-cl.messages:make-tool-call
-                 (getf tc :ID)
+                 (or (getf tc :ID) (format nil "call_~a" i))
                  (getf fn :NAME)
                  (or (getf fn :ARGUMENTS) "{}"))))
 
@@ -142,12 +145,26 @@
         (error 'agent-cl.core:transport-error
                :message "provider returned no choices"
                :retryable t))
+      (unless msg
+        ;; A choice without a message would decode to a turn with no content and
+        ;; no tool calls, which the engine reports as a COMPLETED turn with an
+        ;; empty answer. Treat it as a transport fault instead.
+        (error 'agent-cl.core:transport-error
+               :message "provider returned a choice without a message object"
+               :retryable t))
       (let ((content (getf msg :CONTENT)))
         (make-instance 'turn-result
                        :content (and content (not (eq content :null)) content)
                        :tool-calls (parse-tool-calls (getf msg :TOOL-CALLS))
                        :finish-reason (getf first :FINISH-REASON)
                        :usage (normalize-usage (getf wire :USAGE)))))))
+
+(defun result-truncated-p (result)
+  "True when RESULT was cut off by the provider's token limit (finish_reason
+  \"length\"). Such a completion is NOT a complete answer, and callers that
+  present it as one silently drop the rest of the response."
+  (let ((fr (result-finish-reason result)))
+    (and (stringp fr) (string-equal fr "length"))))
 
 (defun parse-models-response (json-string)
   "Parse a GET /models response into a list of model-id strings, in order.

@@ -191,8 +191,20 @@
        (unless (member value '(t nil))
          (push (format nil "~a: expected boolean, got ~s" path value) problems)))
       ((eq type :array)
-       (unless (listp value)
-         (push (format nil "~a: expected array, got ~s" path value) problems)))
+       (cond
+         ((not (listp value))
+          (push (format nil "~a: expected array, got ~s" path value) problems))
+         (t
+          ;; :items used to be ignored here, so a declared array-of-numbers
+          ;; accepted any element at all: the schema was advisory, not enforced.
+          (let ((items (getf spec :items)))
+            (when items
+              (loop for item in value
+                    for i from 0
+                    do (setf problems
+                             (validate-value items item
+                                             (format nil "~a[~a]" path i)
+                                             problems))))))))
       ((eq type :object)
        (unless (or (null value) (listp value))
          (push (format nil "~a: expected object, got ~s" path value) problems))))
@@ -212,9 +224,14 @@
   (unless (listp value)
     (push (format nil "~a: expected object, got ~s" path value) problems)
     (return-from validate-object problems))
-  ;; required presence
+  ;; required presence. Compared through NORM-PROPERTY-KEY rather than with
+  ;; MEMBER :TEST EQ on raw keys: a decoded object with string keys (the
+  ;; :STRING-KEYS T path) has no EQ-matching keywords, so every required property
+  ;; was reported missing even when present.
   (dolist (r (schema-required schema))
-    (unless (member (prop-key r) value :test #'eq)
+    (unless (loop for (k) on value by #'cddr
+                  thereis (string-equal (string (norm-property-key (prop-key r)))
+                                        (string (norm-property-key k))))
       (push (format nil "~a: missing required property ~a" path r) problems)))
   ;; per-property checks
   (loop for (k v) on value by #'cddr

@@ -119,17 +119,26 @@
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (turn-summary (:constructor %make-turn-summary))
-  done-p final-content steps guard-reason usage tool-count)
+  done-p final-content steps guard-reason usage tool-count stop-reason truncated-p)
 
-(defun make-turn-summary (&key done-p final-content steps guard-reason usage tool-count)
+(defun make-turn-summary (&key done-p final-content steps guard-reason usage tool-count
+                               stop-reason truncated-p)
   (%make-turn-summary :done-p done-p :final-content final-content
                       :steps steps :guard-reason guard-reason
-                      :usage usage :tool-count tool-count))
+                      :usage usage :tool-count tool-count
+                      :stop-reason stop-reason :truncated-p truncated-p))
 
 (defun done-p (s) (turn-summary-done-p s))
 (defun final-content (s) (turn-summary-final-content s))
 (defun steps (s) (turn-summary-steps s))
 (defun guard-reason (s) (turn-summary-guard-reason s))
+(defun stop-reason (s)
+  "Why the turn ended when it did not simply answer: :guard, :model-error,
+  :paused, :step-budget, or NIL when the model answered. Kept separate from
+  GUARD-REASON so a caller can tell 'a rule blocked me' from 'the network died'
+  without parsing a string."
+  (turn-summary-stop-reason s))
+(defun truncated-p (s) (turn-summary-truncated-p s))
 
 ;;; ---------------------------------------------------------------------------
 ;;; extension hooks (defaults: no-ops)
@@ -188,16 +197,28 @@
                              transcript)))))
     (let ((budget (agent-context-budget a)))
       (when (and budget (> (msgs-tokens msgs) budget))
-        ;; Drop oldest whole turns until within budget. Always keep system plus
-        ;; at least one complete turn — never trim down to nothing, and never
-        ;; split a tool-call/tool-result pair.
-        (let ((turns (split-turns (cdr msgs))))
-          (loop while (and (> (length turns) 1)
-                           (> (msgs-tokens
-                               (cons (first msgs) (apply #'append turns)))
-                              budget))
-                do (pop turns))
-          (setf msgs (cons (first msgs) (apply #'append turns))))))
+        ;; Drop oldest whole turns until within budget. Always keep at least one
+        ;; complete turn — never trim down to nothing, and never split a
+        ;; tool-call/tool-result pair.
+        ;;
+        ;; Two defects this replaces: (1) the pinned head was (FIRST MSGS), which
+        ;; is the oldest USER message when the agent has no system prompt — the
+        ;; very message that should be trimmed first was kept forever; (2) the
+        ;; loop recomputed APPLY+MSGS-TOKENS over every remaining turn each
+        ;; iteration, i.e. O(n^2) in the number of turns.
+        (let* ((head (if sys-text (list (first msgs)) nil))
+               (turns (split-turns (if sys-text (rest msgs) msgs)))
+               (counts (mapcar #'msgs-tokens turns))
+               (total (+ (msgs-tokens head) (reduce #'+ counts :initial-value 0))))
+          (loop while (and counts (> total budget))
+                do (decf total (first counts))
+                   (pop counts)
+                   (pop turns))
+          (when (null turns)
+            ;; nothing left to trim to: keep the newest turn intact rather than
+            ;; sending an empty conversation
+            (setf turns (last (split-turns (if sys-text (rest msgs) msgs)))))
+          (setf msgs (append head (apply #'append turns))))))
     msgs))
 
 (defun split-turns (transcript)
@@ -405,28 +426,35 @@
   rule refuses the call outright, which is the only way an audit can prevent a
   write rather than report it afterwards."
   (let* ((name (agent-cl.messages:tool-call-name tc)))
-    (handler-case
-        (let ((args (agent-cl.messages:tool-call-arguments-plist tc)))
-          (multiple-value-bind (action reason rule) (tool-guard-decision agent name args)
-            (cond
-              ((eq action :block)
-               (values (format nil "[审计规则 ~a 拒绝执行 ~a] ~a" rule name reason)
-                       :error))
-              (t
-               (multiple-value-bind (content status)
-                   (agent-cl.tools:call-tool name args agent)
-                 (let ((content (truncate-content content
-                                                  (policy-max-tool-results policy))))
-                   (values (if (eq action :warn)
-                               (format nil "[审计规则 ~a 告警] ~a~%~a"
-                                       rule reason content)
-                               content)
-                           status)))))))
-      (error (e)
-        ;; A malformed arguments JSON (truncated stream, model hallucination)
-        ;; must not crash the whole run; surface it as a tool error result so
-        ;; the transcript stays consistent and the model can retry.
-        (values (format nil "[tool arguments 解析失败: ~a]" e) :error)))))
+    ;; The argument decode has its own, narrow handler: it used to share one
+    ;; (error ...) clause with everything else, so ANY failure inside a tool or a
+    ;; guard was reported to the model as "[tool arguments 解析失败]" — a
+    ;; misleading diagnosis that sent debugging in the wrong direction.
+    (let ((args (handler-case (agent-cl.messages:tool-call-arguments-plist tc)
+                  (error (e)
+                    (return-from dispatch-tool-call
+                      (values (format nil "[tool arguments 解析失败: ~a]" e)
+                              :error))))))
+      (multiple-value-bind (action reason rule) (tool-guard-decision agent name args)
+        (cond
+          ((eq action :block)
+           (values (format nil "[审计规则 ~a 拒绝执行 ~a] ~a" rule name reason)
+                   :error))
+          (t
+           (multiple-value-bind (content status)
+               (agent-cl.tools:call-tool name args agent)
+             (let ((content (truncate-content content
+                                              (policy-max-tool-results policy))))
+               (values (if (eq action :warn)
+                           (format nil "[审计规则 ~a 告警] ~a~%~a"
+                                   rule reason content)
+                           content)
+                       status)))))))))
+
+(defvar *turn-tokens-emitted* nil
+  "True once ON-TOKEN has been called for the current streaming attempt. A retry
+  after that point would REPLAY text the user has already seen, so it is not
+  allowed — the failure is surfaced instead of silently duplicating output.")
 
 (defun drain-stream-turn (agent params on-token)
   "Run a streaming request and accumulate the turn, calling ON-TOKEN with text
@@ -441,15 +469,22 @@
                  do (when on-token
                       (let ((text (agent-cl.llm:stream-text turn)))
                         (when (> (length text) prev)
+                          (setf *turn-tokens-emitted* t)
                           (funcall on-token (subseq text prev))
                           (setf prev (length text))))))
-           ;; EOF without [DONE] and without a finish_reason means the stream
-           ;; was cut short (network drop / provider error): surface it instead
-           ;; of silently returning truncated text or half-parsed tool args.
+           ;; A stream that ends without [DONE] AND without a finish_reason was
+           ;; cut short (network drop / provider error). Note that a provider may
+           ;; legally omit [DONE] while still sending finish_reason (some
+           ;; compatible endpoints do), which is why BOTH must be missing.
            (when (and (not (agent-cl.llm:stream-done-seen turn))
                       (null (agent-cl.llm:stream-finish turn)))
+             ;; EOF with no tool calls, no finish and no text is an empty turn,
+             ;; not a dropped connection: report it as retryable either way, but
+             ;; keep the distinction in the message.
              (error 'agent-cl.core:transport-error
-                    :message "stream ended before [DONE] (connection dropped?)"
+                    :message (if (plusp (length (agent-cl.llm:stream-text turn)))
+                                 "stream ended before [DONE] (connection dropped?)"
+                                 "stream ended without [DONE] or finish_reason")
                     :retryable t))
            (agent-cl.llm:stream-finalize turn))))))
 
@@ -460,19 +495,92 @@
 (defun stop (agent)
   (setf (agent-stopped-p agent) t))
 
+(defun remember (agent msg)
+  "Append MSG to the transcript AND mirror it into the agent's memory store, so
+  (memory-window (agent-memory agent)) is a real view of the conversation. The
+  memory object used to be allocated and never touched by the engine."
+  (setf (agent-messages agent) (append (agent-messages agent) (list msg)))
+  (when (agent-memory agent)
+    (memory-add (agent-memory agent) msg))
+  msg)
+
+(defun ensure-tool-results (agent note)
+  "Append a placeholder tool result for every tool call of the LAST assistant
+  message that does not have one. Idempotent.
+
+  Needed because the assistant message is recorded BEFORE its tools run: if the
+  dispatch loop is unwound by an interrupt (or any condition), the transcript is
+  left with a tool_calls message that has fewer results than calls. That is an
+  illegal message sequence for OpenAI/DeepSeek, so the NEXT request fails with
+  400 and the session is permanently broken — not just this turn."
+  (let* ((msgs (agent-messages agent))
+         (assistant (find-if (lambda (m) (eq (agent-cl.messages:msg-role m) :assistant))
+                             (reverse msgs)))
+         (calls (and assistant (agent-cl.messages:msg-tool-calls assistant))))
+    (when calls
+      (let ((answered nil))
+        (dolist (m (reverse msgs))
+          (cond ((eq m assistant) (return))
+                ((eq (agent-cl.messages:msg-role m) :tool)
+                 (push (agent-cl.messages:msg-tool-call-id m) answered))))
+        (dolist (tc calls)
+          (unless (member (agent-cl.messages:tool-call-id tc) answered :test #'equal)
+            (remember agent
+                      (agent-cl.messages:tool-result-message
+                       (agent-cl.messages:tool-call-id tc) note)))))
+      t)))
+
+(defun execute-tool-round (agent result policy)
+  "Record the assistant tool-call message for RESULT and run its calls.
+  Returns how many calls were actually executed.
+
+  Every advertised tool call ends up with a tool result: extras that serial mode
+  skips get an explicit note, and if dispatch is unwound by an interrupt the
+  remaining calls get placeholders. Without that, the transcript holds a
+  tool_calls message with fewer results than calls — an illegal sequence for
+  OpenAI/DeepSeek, so every LATER request in the session fails with 400."
+  (let* ((tcs (agent-cl.llm:result-tool-calls result))
+         (parallel (policy-parallel-tools policy))
+         (to-run (if parallel tcs (subseq tcs 0 (min 1 (length tcs)))))
+         (skipped (if parallel nil (subseq tcs (min 1 (length tcs))))))
+    (remember agent
+              (agent-cl.messages:assistant-message
+               (or (agent-cl.llm:result-content result) "")
+               :tool-calls tcs))
+    (unwind-protect
+         (progn
+           (dolist (tc to-run)
+             (multiple-value-bind (content status)
+                 (dispatch-tool-call agent tc policy)
+               (on-tool-result agent
+                               (agent-cl.messages:tool-call-name tc)
+                               (list :content content :status status))
+               (remember agent
+                         (agent-cl.messages:tool-result-message
+                          (agent-cl.messages:tool-call-id tc)
+                          content))))
+           (dolist (tc skipped)
+             (remember agent
+                       (agent-cl.messages:tool-result-message
+                        (agent-cl.messages:tool-call-id tc)
+                        "[未执行：本 agent 为串行（parallel-tools=nil）模式，一次只运行第一个工具调用]"))))
+      (ensure-tool-results
+       agent "[中断：该工具调用未执行，结果占位以保持消息配对]"))
+    (length to-run)))
+
 (defun run (agent task &key (max-steps nil) (stream nil) (on-token nil))
   "Drive AGENT on TASK until the model answers, a guard fires, or the step
   budget is exhausted (a NIL budget = no step limit; the agent runs until it
   answers or is stopped). Returns a turn-summary; the conversation transcript
   remains in (agent-messages agent)."
   (setf (agent-stopped-p agent) nil)
-  (setf (agent-messages agent)
-        (append (agent-messages agent)
-                (list (agent-cl.messages:user-message task))))
+  (remember agent (agent-cl.messages:user-message task))
   (let* ((policy (agent-policy agent))
          (budget (or max-steps (agent-max-steps agent) (policy-max-steps policy)))
          (step 0)
          (guard-reason nil)
+         (stop-reason nil)
+         (truncated nil)
          (final nil)
          (tool-count 0))
     (loop while (and (or (null budget) (< step budget))
@@ -481,77 +589,84 @@
           do (incf step)
              (on-step-start agent (list :step step))
              (let ((gr (guard-violation-p agent)))
-               (when gr (setf guard-reason gr) (return)))
+               (when gr (setf guard-reason gr stop-reason :guard) (return)))
              (let* ((params (build-request-params agent :stream stream))
-                    (before (progn (before-llm-call agent params) nil))
-                    (outcome (call-model agent params stream on-token)))
-               (declare (ignore before))
+                    (outcome (progn (before-llm-call agent params)
+                                    (call-model agent params stream on-token))))
                (cond
                  ((eq (first outcome) :error)
-                  (setf guard-reason (second outcome))
+                  ;; A failed model call is NOT a guard trip. GUARD-REASON still
+                  ;; carries a readable string for display, but STOP-REASON says
+                  ;; what really happened.
+                  (setf guard-reason (second outcome)
+                        stop-reason :model-error)
                   (setf final (make-turn-summary :done-p nil
                                                  :guard-reason guard-reason
-                                                 :steps step :tool-count tool-count)))
+                                                 :stop-reason stop-reason
+                                                 :steps step
+                                                 :tool-count tool-count)))
                  (t
                   (let ((result (second outcome)))
                     (add-usage agent (agent-cl.llm:result-usage result))
+                    (when (agent-cl.llm:result-truncated-p result)
+                      (setf truncated t))
                     (if (agent-cl.llm:result-tool-calls result)
-                        (let* ((tcs (agent-cl.llm:result-tool-calls result))
-                               ;; In serial mode only the first call runs; record
-                               ;; only what we actually execute so the transcript
-                               ;; never holds a tool_call without its tool result
-                               ;; (an illegal sequence for OpenAI/DeepSeek -> 400).
-                               (to-run (if (policy-parallel-tools policy)
-                                           tcs
-                                           (subseq tcs 0 (min 1 (length tcs))))))
-                          (setf (agent-messages agent)
-                                (append (agent-messages agent)
-                                        (list (agent-cl.messages:assistant-message
-                                               (or (agent-cl.llm:result-content result) "")
-                                               :tool-calls to-run))))
-                          (incf tool-count (length to-run))
-                          (dolist (tc to-run)
-                            (multiple-value-bind (content status)
-                                (dispatch-tool-call agent tc policy)
-                              (on-tool-result agent
-                                              (agent-cl.messages:tool-call-name tc)
-                                              (list :content content :status status))
-                              (setf (agent-messages agent)
-                                    (append (agent-messages agent)
-                                            (list (agent-cl.messages:tool-result-message
-                                                   (agent-cl.messages:tool-call-id tc)
-                                                   content)))))))
+                        (incf tool-count (execute-tool-round agent result policy))
                         (let ((content (or (agent-cl.llm:result-content result) "")))
-                          (setf (agent-messages agent)
-                                (append (agent-messages agent)
-                                        (list (agent-cl.messages:assistant-message content))))
+                          (remember agent
+                                    (agent-cl.messages:assistant-message content))
                           (setf final (make-turn-summary
-                                       :done-p t :final-content content
-                                       :steps step :tool-count tool-count
+                                       :done-p t
+                                       :final-content content
+                                       :steps step
+                                       :tool-count tool-count
+                                       :truncated-p truncated
                                        :usage (agent-cl.llm:result-usage result))))))))))
-    (let ((summary
-            (or final
-                (make-turn-summary :done-p nil
-                                   :guard-reason (or guard-reason
-                                                      (if (agent-stopped-p agent)
-                                                          :paused
-                                                          :max-steps))
-                                   :steps step :tool-count tool-count))))
+    (let ((summary (or final
+                       (make-turn-summary
+                        :done-p nil
+                        :guard-reason (or guard-reason
+                                          (if (agent-stopped-p agent)
+                                              "用户中断（stop）"
+                                              "步数预算用尽"))
+                        :stop-reason (or stop-reason
+                                         (if (agent-stopped-p agent)
+                                             :paused
+                                             :step-budget))
+                        :steps step
+                        :tool-count tool-count))))
       ;; Fire the completion hook on the finished turn. This is the only place a
       ;; caller learns the agent is done, so a display layer can print e.g. a
       ;; sub-agent's conclusion the moment that (child) agent finishes.
       (on-turn-done agent summary)
       summary)))
+
+(defun sleep-interruptibly (seconds agent)
+  "Sleep SECONDS in small slices, returning NIL if the agent was stopped. A plain
+  SLEEP made a Ctrl-C / stop() wait out the whole backoff (up to 8s)."
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* seconds internal-time-units-per-second)))))
+    (loop while (< (get-internal-real-time) deadline)
+          do (when (agent-stopped-p agent) (return nil))
+             (sleep (min 0.1 (/ (- deadline (get-internal-real-time))
+                                internal-time-units-per-second))))
+    (not (agent-stopped-p agent))))
+
 (defun call-model (agent params stream on-token)
   "One LLM round trip with automatic retry of transient transport failures
   (5xx/429, i.e. transport-error with RETRYABLE-P). Retry count is bounded by
   AGENT-CL.LLM:*MAX-RETRIES* and gated by the policy's ALLOW-MODEL-RETRY flag.
-  Returns (:ok turn-result) or (:error readable-reason)."
+  Returns (:ok turn-result) or (:error readable-reason).
+
+  A streaming attempt that already emitted tokens is NEVER retried: the delta
+  callback has no way to un-print what the user has seen, so a retry would show
+  the same text twice. Those failures are surfaced instead."
   (let* ((policy (agent-policy agent))
          (budget (if (policy-allow-model-retry policy)
                      (or agent-cl.llm:*max-retries* 0)
                      0))
-         (attempt 0))
+         (attempt 0)
+         (*turn-tokens-emitted* nil))
     (loop
       (handler-case
           (return
@@ -564,17 +679,23 @@
                         (format nil "paused: ~a"
                                 (agent-cl.core:agent-pause-reason p)))))
         (agent-cl.core:transport-error (e)
-          (let ((msg (agent-cl.core:agent-error-message e)))
-            (if (and (agent-cl.core:transport-error-retryable-p e)
-                     (< attempt budget))
-                (progn
-                  (incf attempt)
-                  (let ((backoff (min 8.0 (* 0.25 (expt 2 (1- attempt))))))
-                    (format t "~&[retry ~a/~a after ~,1fs] ~a~%"
-                            attempt budget backoff msg)
-                    (finish-output)
-                    (sleep backoff)))
-                (return (list :error (or msg (princ-to-string e)))))))
+          (let ((msg (or (agent-cl.core:agent-error-message e)
+                         (princ-to-string e)))
+                (retryable (agent-cl.core:transport-error-retryable-p e)))
+            (cond
+              ((agent-stopped-p agent)
+               (return (list :error "已停止（stop），不再重试")))
+              ((and retryable *turn-tokens-emitted*)
+               (return (list :error
+                             (format nil "~a（已输出部分内容，不再重试以免重复显示）" msg))))
+              ((and retryable (< attempt budget))
+               (incf attempt)
+               (let ((backoff (min 8.0 (* 0.25 (expt 2 (1- attempt))))))
+                 (format t "~&[retry ~a/~a after ~,1fs] ~a~%" attempt budget backoff msg)
+                 (finish-output)
+                 (unless (sleep-interruptibly backoff agent)
+                   (return (list :error "重试等待期间被用户停止")))))
+              (t (return (list :error msg))))))
         (agent-cl.core:agent-error (e)
           (return (list :error (agent-cl.core:agent-error-message e))))
         (error (e)

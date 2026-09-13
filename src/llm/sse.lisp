@@ -22,7 +22,11 @@
    (usage       :initarg :usage :initform nil :accessor stream-usage)
    (finish      :initarg :finish :initform nil :accessor stream-finish)
    (finished    :initarg :finished :initform nil :accessor stream-finished-p)
-   (done-seen   :initform nil :accessor stream-done-seen)))
+   (done-seen   :initform nil :accessor stream-done-seen)
+   ;; FINALIZE is destructive (it drains the argument output streams), so the
+   ;; built result is cached: a second call must return the same turn instead of
+   ;; one whose tool arguments have been emptied.
+   (result      :initform nil :accessor stream-result)))
 
 (defun stream-append-text (turn text)
   (let ((v (slot-value turn 'text)))
@@ -42,10 +46,16 @@
   "Return the data payload of an SSE line, or :DONE / :IGNORE."
   (let ((l (string-trim '(#\Return #\Newline #\Space #\Tab) line)))
     (cond ((zerop (length l)) :ignore)
-          ((string= l "[DONE]") :done)
-          ((string= l "data: [DONE]") :done)
-          ((string-prefix-p "data:" l)
-           (string-trim '(#\Space) (subseq l 5)))
+          ((string-equal l "[DONE]") :done)
+          ;; The field name is compared case-insensitively. SSE specifies
+          ;; lowercase, but proxies and hand-rolled servers do emit "Data:", and
+          ;; the cost of being strict is a silently truncated stream.
+          ((and (> (length l) 4) (string-equal "data:" l :end2 5))
+           ;; The payload is re-checked for [DONE]: providers write both
+           ;; "data: [DONE]" and "data:[DONE]", and the latter used to fall
+           ;; through to the JSON decoder and fail the whole stream.
+           (let ((payload (string-trim '(#\Space #\Tab #\Return) (subseq l 5))))
+             (if (string-equal payload "[DONE]") :done payload)))
           (t :ignore))))
 
 (defun stream-feed (turn line)
@@ -87,21 +97,34 @@
          :ok)))))
 
 (defun stream-finalize (turn)
-  "Build the final turn-result from the accumulated stream state."
-  (let ((tcs
-          (loop for idx from 0
-                for acc = (gethash idx (stream-tool-accs turn))
-                while acc
-                collect (agent-cl.messages:make-tool-call
-                         (tool-call-accum-id acc)
-                         (tool-call-accum-name acc)
-                         (acc-arguments-string acc)))))
-    (make-instance 'turn-result
-                   :content (let ((s (stream-text turn)))
-                              (and (plusp (length s)) s))
-                   :tool-calls tcs
-                   :finish-reason (stream-finish turn)
-                   :usage (stream-usage turn))))
+  "Build the final turn-result from the accumulated stream state. Idempotent:
+  the result is built once and cached (draining the argument streams is
+  destructive, so a second build would produce empty tool arguments)."
+  (or (stream-result turn)
+      (let ((tcs
+              ;; Iterate by INDEX, not by probing 0,1,2,...: a provider that
+              ;; starts at index 1 (or skips one) used to lose every tool call
+              ;; after the gap.
+              (loop for acc in (sort (loop for a being the hash-values
+                                             of (stream-tool-accs turn)
+                                           collect a)
+                                     #'< :key #'tool-call-accum-index)
+                    collect (agent-cl.messages:make-tool-call
+                             ;; A missing id breaks the wire contract: the tool
+                             ;; result must reference the call it answers, and an
+                             ;; id of NIL is rejected by the provider. Synthesize
+                             ;; a stable one instead.
+                             (or (tool-call-accum-id acc)
+                                 (format nil "call_~a" (tool-call-accum-index acc)))
+                             (tool-call-accum-name acc)
+                             (acc-arguments-string acc)))))
+        (setf (stream-result turn)
+              (make-instance 'turn-result
+                             :content (let ((s (stream-text turn)))
+                                        (and (plusp (length s)) s))
+                             :tool-calls tcs
+                             :finish-reason (stream-finish turn)
+                             :usage (stream-usage turn))))))
 
 (defun string-prefix-p (prefix string)
   (and (>= (length string) (length prefix))

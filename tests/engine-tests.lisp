@@ -170,7 +170,11 @@
                             :policy (make-policy :max-steps 2)))
          (summary (run agent "无限循环任务")))
     (ok (not (done-p summary)))
-    (is-equal :max-steps (guard-reason summary))
+    ;; GUARD-REASON is always a readable string; STOP-REASON carries the machine
+    ;; readable reason. They used to be mixed into one field (a keyword sometimes,
+    ;; a message other times), so no caller could branch on it safely.
+    (is-equal :step-budget (stop-reason summary))
+    (ok (search "步数" (guard-reason summary)))
     (is-equal 2 (steps summary)))
   (unregister-tool "test.square"))
 

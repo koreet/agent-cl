@@ -59,7 +59,8 @@
                                :policy (make-policy :max-steps 6)))
          (summary (run agent "跑起来然后我打断你")))
     (ok (not (done-p summary)))
-    (is-equal :paused (guard-reason summary))
+    (is-equal :paused (stop-reason summary))
+    (ok (search "中断" (guard-reason summary)))
     ;; transcript already contains the executed tool round
     (ok (find :tool (mapcar (lambda (m) (agent-cl.messages:msg-role m))
                             (agent-messages agent)))))

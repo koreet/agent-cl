@@ -43,19 +43,31 @@
   do not use :null sentinels — acceptable for optional fields)."
   (yason:parse string))
 
+(defvar *json-key-cache* (make-hash-table :test 'equal)
+  "JSON key string -> keyword, so repeated keys (every message of every request)
+  do not re-run substitute/upcase/INTERN. One chokepoint for the key conversion.
+
+  Note on interning: keys still become KEYWORDS, which are permanent. That is
+  bounded by the number of DISTINCT keys a provider/model sends (small: a fixed
+  response schema), but a caller decoding a genuinely untrusted key space should
+  pass :STRING-KEYS T and avoid interning altogether.")
+
+(defun json-key->keyword (k)
+  (or (gethash k *json-key-cache*)
+      (setf (gethash k *json-key-cache*)
+            ;; JSON snake_case -> Lisp kebab-case keyword
+            (intern (substitute #\- #\_ (string-upcase k)) :keyword))))
+
 (defun object-to-plist (decoded &key (string-keys nil))
   "Recursively convert a yason-decoded structure into plists.
-  JSON object keys become keywords when STRING-KEYS is NIL (uppercased via
-  STRING-UPCASE), else stay strings. This is the shape tools receive."
-  (labels ((key->keyword (k)
-             ;; JSON snake_case -> Lisp kebab-case keyword
-             (intern (substitute #\- #\_ (string-upcase k)) :keyword))
-           (conv (x)
+  JSON object keys become keywords when STRING-KEYS is NIL, else stay strings.
+  Duplicate keys cannot reach this function: yason decodes an object into a
+  hash-table, where the last occurrence wins (matching JSON semantics)."
+  (labels ((conv (x)
              (cond ((hash-table-p x)
                     (let (pairs)
                       (maphash (lambda (k v)
-                                 (push (cons (if string-keys k
-                                                 (key->keyword k))
+                                 (push (cons (if string-keys k (json-key->keyword k))
                                              (conv v))
                                        pairs))
                                x)

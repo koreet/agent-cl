@@ -116,6 +116,11 @@
           (if (eq status :error)
               (values (payload->string payload) :error)
               (values (payload->string (or payload "")) :ok)))
+      ;; A pause is CONTROL FLOW, not a tool failure: a tool that wants the agent
+      ;; to stop (asking the user, hitting an interrupt) must reach the engine and
+      ;; the caller. Swallowing it here turned "the user was asked" into a
+      ;; meaningless :error string the model would try to work around.
+      (agent-cl.core:agent-pause (e) (error e))
       (agent-cl.core:tool-error (e)
         (values (format nil "tool error [~a]: ~a"
                         (agent-cl.core:tool-error-code e)

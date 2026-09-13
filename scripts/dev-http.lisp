@@ -78,25 +78,50 @@
         (values (and rs (ignore-errors (funcall rs c)))
                 (http-body-text (and rb (ignore-errors (funcall rb c)))))))))
 
-(defun dexador-post (post url request-json headers stream)
+(defun transient-network-condition-p (c)
+  "True when C looks like a TRANSIENT connection failure rather than a provider
+  answer. Only dexador's HTTP status conditions used to become retryable
+  transport errors, so a connection reset / TLS timeout / DNS blip surfaced as
+  `unexpected:` and was never retried even though the policy allows retries."
+  (let ((name (string-downcase (princ-to-string (type-of c)))))
+    (or (some (lambda (needle) (search needle name))
+              '("connection" "timeout" "timed-out" "eof" "end-of-file"
+                "reset" "broken-pipe" "unreachable" "host-not-found"
+                "ssl" "tls"))
+        (let ((msg (string-downcase (princ-to-string c))))
+          (some (lambda (needle) (search needle msg))
+                '("timed out" "connection reset" "connection refused"
+                  "unexpected eof" "ssl" "handshake"))))))
+
+(defun dexador-post (post url request-json headers stream &key (timeout 120))
   "POST to URL, converting dexador's continuable http-request-failed (raised
   for any status >= 400, with the body as a decoding stream) into a clean
-  agent-cl transport-error. Returns BODY on 2xx."
+  agent-cl transport-error. Returns BODY on 2xx.
+
+  TIMEOUT is the caller's request timeout (the transport's
+  *REQUEST-TIMEOUT-SECONDS*); it used to be ignored in favour of hard-coded
+  values, so configuring a shorter timeout had no effect. Streaming gets a
+  larger read window because a model can think for a while between chunks."
   (let ((args (append (list :content request-json
                             :headers headers
-                            :read-timeout (if stream 240 120)
-                            :connect-timeout 30)
+                            :read-timeout (if stream (max timeout 240) timeout)
+                            :connect-timeout (min timeout 30))
                       (when stream (list :want-stream t :force-string t)))))
     (handler-bind
         ((error
           (lambda (c)
             (multiple-value-bind (st bt) (dexador-failed-info c)
-              (when st
-                (error 'agent-cl.core:transport-error
-                       :message (format nil "http ~a: ~a" st bt)
-                       :status st
-                       ;; 5xx and 429 (rate limit) are transient; 4xx are not
-                       :retryable (or (>= st 500) (= st 429))))))))
+              (cond
+                (st
+                 (error 'agent-cl.core:transport-error
+                        :message (format nil "http ~a: ~a" st bt)
+                        :status st
+                        ;; 5xx and 429 (rate limit) are transient; 4xx are not
+                        :retryable (or (>= st 500) (= st 429))))
+                ((transient-network-condition-p c)
+                 (error 'agent-cl.core:transport-error
+                        :message (format nil "network error: ~a" c)
+                        :retryable t)))))))
       (multiple-value-bind (body status)
           (apply post url args)
         (unless (<= 200 status 299)
@@ -115,11 +140,11 @@
       (setf (symbol-value backend-var) :usocket)
       (setf agent-cl.llm:*http-fetch-hook*
             (lambda (request-json &key base-url api-key timeout stream)
-              (declare (ignore timeout))
               (let ((url (concatenate 'string base-url "/chat/completions"))
                     (headers `(("Content-Type" . "application/json")
                                ("Authorization" . ,(format nil "Bearer ~a" api-key)))))
-                (dexador-post post url request-json headers stream)))))
+                (dexador-post post url request-json headers stream
+                              :timeout (or timeout 120))))))
     t))
 
 (defun enable-hook (&key (ca-file *ca-file*))

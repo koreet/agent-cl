@@ -74,6 +74,7 @@
    ;; --- chat result ---
    #:turn-result
    #:result-content #:result-tool-calls #:result-finish-reason #:result-usage
+   #:result-truncated-p
    #:complete-turn
    ;; --- streaming ---
    #:streaming-turn
@@ -140,6 +141,7 @@
    #:on-step-start #:on-tool-result #:on-turn-done #:before-llm-call #:choose-messages
    ;; results
    #:turn-summary #:done-p #:final-content #:steps #:guard-reason
+   #:stop-reason #:truncated-p
     #:turn-summary-tool-count
    ;; memory
    #:memory #:memory-add #:memory-window #:memory-compact))
