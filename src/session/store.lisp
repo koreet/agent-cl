@@ -42,7 +42,22 @@
   (merge-pathnames ".tools/sessions/"
                    (uiop:getcwd)))
 
+(defun valid-session-id-p (id)
+  "True when ID is safe to use as a single session directory name.
+
+  The id becomes a path component and MAKE-SESSION/SESSION-APPEND create and write
+  through it, so an id containing a separator, a drive or two dots would escape the
+  sessions root (verified: the id two-levels-up + /escapee computed a directory
+  outside the root). Only the characters our own generator produces are accepted."
+  (and (stringp id)
+       (plusp (length id))
+       (<= (length id) 128)
+       (every (lambda (c) (or (alphanumericp c) (member c '(#\- #\_))))
+              id)))
+
 (defun session-dir (sid directory)
+  (unless (valid-session-id-p sid)
+    (error "invalid session id ~s (expected [A-Za-z0-9_-]+)" sid))
   (merge-pathnames (format nil "~a/" sid)
                    (uiop:ensure-directory-pathname
                     (or directory *default-session-root*))))

@@ -9,6 +9,19 @@
 
 (defparameter *si-test-file* ".tools/si-test-target.txt")
 
+(defmacro with-writable-fixture (&body body)
+  "Run BODY with the protected-path list minus the .tools/ prefix.
+
+  The fixtures at .tools/si-test-target.txt are the throwaway target of the GATE
+  contract tests; .tools/ is protected in production because it holds the vendored
+  dependencies and the ASDF cache. The protection behaviour itself is covered by
+  SELFIMPROVE-REFUSES-TO-PATCH-THE-GATE-ITSELF and
+  SELFIMPROVE-REFUSES-PATHS-OUTSIDE-THE-REPO, which use the real list."
+  `(let ((agent-cl.selfimprove::*protected-paths*
+           (remove ".tools/" agent-cl.selfimprove::*protected-paths*
+                   :test #'string=)))
+     ,@body))
+
 (defun write-si-old ()
   (write-file-string *si-test-file* "OLD-CONTENT"))
 
@@ -17,49 +30,60 @@
 
 ;; --- adopt: a patch whose gate passes is kept ---------------------------------
 (deftest selfimprove-adopts-passing-patch
-  (write-si-old)
+  (with-writable-fixture
+     (write-si-old)
   (let ((res (agent-cl.selfimprove:improve-file
               *si-test-file* "NEW-CONTENT"
               (lambda () (values t "ok")))))
     (is-equal :adopted (getf res :status))
-    (is-equal "NEW-CONTENT" (read-si))))
+    (is-equal "NEW-CONTENT" (read-si)))))
+
 
 ;; --- rollback: a patch whose gate fails restores the original bytes -----------
 (deftest selfimprove-rolls-back-failing-patch
-  (write-si-old)
+  (with-writable-fixture
+     (write-si-old)
   (let ((res (agent-cl.selfimprove:improve-file
               *si-test-file* "BROKEN-CONTENT"
               (lambda () (values nil "build failed")))))
     (is-equal :rolled-back (getf res :status))
-    (is-equal "OLD-CONTENT" (read-si) "file must be byte-restored after a bad patch")))
+    (is-equal "OLD-CONTENT" (read-si) "file must be byte-restored after a bad patch"))))
+
 
 ;; --- no-op: identical content changes nothing --------------------------------
 (deftest selfimprove-nochange-on-identical-content
-  (write-si-old)
+  (with-writable-fixture
+     (write-si-old)
   (let ((res (agent-cl.selfimprove:improve-file
               *si-test-file* "OLD-CONTENT"
               (lambda () (values t nil)))))
     (is-equal :no-change (getf res :status))
-    (is-equal "OLD-CONTENT" (read-si))))
+    (is-equal "OLD-CONTENT" (read-si)))))
+
 
 ;; --- reject: absent / unreadable path ----------------------------------------
 (deftest selfimprove-rejects-absent-path
-  (let ((res (agent-cl.selfimprove:improve-file
+  (with-writable-fixture
+     (let ((res (agent-cl.selfimprove:improve-file
               ".tools/definitely-not-here-si.txt" "x"
               (lambda () (values t nil)))))
-    (is-equal :rejected (getf res :status))))
+    (is-equal :rejected (getf res :status)))))
+
 
 ;; --- reject: blank content ----------------------------------------------------
 (deftest selfimprove-rejects-blank-content
-  (write-si-old)
+  (with-writable-fixture
+     (write-si-old)
   (let ((res (agent-cl.selfimprove:improve-file
               *si-test-file* "   " (lambda () (values t nil)))))
     (is-equal :rejected (getf res :status))
-    (is-equal "OLD-CONTENT" (read-si) "file untouched when new content blank")))
+    (is-equal "OLD-CONTENT" (read-si) "file untouched when new content blank"))))
+
 
 ;; --- audit: adopting with keep-backup-on-pass leaves a trace ------------------
 (deftest selfimprove-keep-backup-on-pass
-  (write-si-old)
+  (with-writable-fixture
+     (write-si-old)
   (let* ((bkdir ".tools/si-bk-test/")
          (res (agent-cl.selfimprove:improve-file
                *si-test-file* "AUDITED-CONTENT"
@@ -76,12 +100,14 @@
     (dolist (f (directory bkdir)) (ignore-errors (delete-file f)))
     (ignore-errors ; whole-session --script leaves the tree; fine under harness
       ))
-  (ignore-errors (delete-file ".tools/si-test-target.txt")))
+  (ignore-errors (delete-file ".tools/si-test-target.txt"))))
+
 
 
 ;; --- gate raises an exception -> treated as a failed gate, rolls back --------
 (deftest selfimprove-gate-throws-rolls-back
-  ;; A gate that signals (rather than returning nil) must NOT leave a partial
+  (with-writable-fixture
+     ;; A gate that signals (rather than returning nil) must NOT leave a partial
   ;; patch: the file has to be rolled back to its original bytes.
   (write-si-old)
   (let* ((bkdir ".tools/si-throw-bk/")
@@ -99,7 +125,8 @@
     (agent-cl.core:write-file-string *si-test-file* "OLD-CONTENT" :if-exists :supersede)
     (when (probe-file bkdir)
       (dolist (f (directory bkdir)) (ignore-errors (delete-file f)))))
-  (ignore-errors (delete-file ".tools/si-test-target.txt")))
+  (ignore-errors (delete-file ".tools/si-test-target.txt"))))
+
 
 
 ;; --- confinement: the primitive must not rewrite files outside the repo -------
@@ -152,7 +179,8 @@
         "the gate script must be reachable from the repo root")))
 
 (deftest selfimprove-confinement-works-inside-the-repo
-  "The confinement must not break the normal case: a path inside the repo (the
+  (with-writable-fixture
+     "The confinement must not break the normal case: a path inside the repo (the
   throwaway .tools/ target used by these tests) is accepted."
   (write-si-old)
   (is-equal ".tools/si-test-target.txt"
@@ -161,4 +189,5 @@
               *si-test-file* "CONFINED-OK" (lambda () (values t "ok")))))
     (is-equal :adopted (getf res :status))
     (is-equal "CONFINED-OK" (read-si)))
-  (ignore-errors (delete-file ".tools/si-test-target.txt")))
+  (ignore-errors (delete-file ".tools/si-test-target.txt"))))
+

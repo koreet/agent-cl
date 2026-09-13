@@ -7,6 +7,15 @@
 ;;;; §5.3).
 (in-package #:agent-cl.llm)
 
+(defvar *tool-call-id-counter* 0
+  "Process-wide source of synthesized tool-call ids (see FRESH-TOOL-CALL-ID).")
+
+(defun fresh-tool-call-id ()
+  "A tool-call id that is unique within this PROCESS, so ids cannot collide
+  across turns of one conversation (providers require tool_call_ids to be
+  distinct in a transcript)."
+  (format nil "call_~a" (incf *tool-call-id-counter*)))
+
 (defstruct (tool-call-accum (:constructor make-tool-call-accum (index)))
   index
   (id nil)
@@ -55,7 +64,12 @@
            ;; "data: [DONE]" and "data:[DONE]", and the latter used to fall
            ;; through to the JSON decoder and fail the whole stream.
            (let ((payload (string-trim '(#\Space #\Tab #\Return) (subseq l 5))))
-             (if (string-equal payload "[DONE]") :done payload)))
+             (cond ((string-equal payload "[DONE]") :done)
+                   ;; An empty data field is a heartbeat / empty event: SSE says
+                   ;; to ignore it. Handing "" to the JSON decoder raised
+                   ;; end-of-file and killed an otherwise healthy stream.
+                   ((zerop (length payload)) :ignore)
+                   (t payload))))
           (t :ignore))))
 
 (defun stream-feed (turn line)
@@ -67,7 +81,17 @@
                    (stream-done-seen turn) t)
              :done)
       (otherwise
-       (let* ((obj (agent-cl.core:decode-to-plist payload))
+       ;; A chunk cut in half by a dropped connection lands here as invalid JSON.
+       ;; Raising a raw END-OF-FILE from inside yason surfaced as
+       ;; "unexpected: end of file on ...STRING-INPUT-STREAM" and — because it is
+       ;; not a TRANSPORT-ERROR — was never retried, even though nothing had been
+       ;; shown to the user yet.
+       (let* ((obj (handler-case (agent-cl.core:decode-to-plist payload)
+                     (error (e)
+                       (error 'agent-cl.core:transport-error
+                              :message (format nil "malformed or truncated SSE chunk: ~a"
+                                               e)
+                              :retryable t))))
               (usage (getf obj :USAGE)))
          (when usage (setf (stream-usage turn) (normalize-usage usage)))
          (let ((choices (getf obj :CHOICES)))
@@ -109,15 +133,22 @@
                                              of (stream-tool-accs turn)
                                            collect a)
                                      #'< :key #'tool-call-accum-index)
+                    for args = (acc-arguments-string acc)
                     collect (agent-cl.messages:make-tool-call
                              ;; A missing id breaks the wire contract: the tool
                              ;; result must reference the call it answers, and an
-                             ;; id of NIL is rejected by the provider. Synthesize
-                             ;; a stable one instead.
-                             (or (tool-call-accum-id acc)
-                                 (format nil "call_~a" (tool-call-accum-index acc)))
+                             ;; id of NIL is rejected by the provider. The
+                             ;; synthesized id comes from a PROCESS-WIDE counter:
+                             ;; numbering per response made two id-less replies in
+                             ;; one conversation both use call_0, i.e. duplicate
+                             ;; tool_call_ids in the same transcript.
+                             (or (tool-call-accum-id acc) (fresh-tool-call-id))
                              (tool-call-accum-name acc)
-                             (acc-arguments-string acc)))))
+                             ;; an empty accumulator means the fragments never
+                             ;; arrived; "{}" is what the non-streaming parser
+                             ;; produces, and "" is not JSON at all (it broke
+                             ;; argument parsing and was replayed to the provider)
+                             (if (zerop (length args)) "{}" args)))))
         (setf (stream-result turn)
               (make-instance 'turn-result
                              :content (let ((s (stream-text turn)))

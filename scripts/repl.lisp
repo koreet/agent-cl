@@ -505,10 +505,15 @@
   悬空 assistant tool_calls（其后无 tool 结果），避免续谈时向 provider
   发送非法消息序列（tool 无前置 assistant / assistant tool_calls 无结果）。
   中间序列信任导出端（引擎保证配对）。"
-  ;; 1) drop leading orphan tool results
-  (let ((ms (loop for m in msgs
-                  while (eq (agent-cl.messages:msg-role m) :tool)
-                  finally (return msgs))))
+  ;; 1) drop leading orphan tool results.
+  ;; NB: this was (loop for m in msgs while ... finally (return msgs)) — a LOOP
+  ;; that accumulates nothing and whose FINALLY returns the ORIGINAL list, so it
+  ;; was DEAD CODE and an imported transcript could still start with role "tool",
+  ;; which OpenAI-compatible endpoints reject with 400.
+  (let* ((trimmed (loop for tail on msgs
+                        unless (eq (agent-cl.messages:msg-role (car tail)) :tool)
+                          return tail))
+         (ms (or trimmed nil)))
     ;; 2) drop a trailing assistant message that carries tool_calls but has no
     ;; tool result after it (interrupted mid-turn export).
     (let ((n (length ms)))
@@ -528,13 +533,26 @@
   IMPORT-TRANSCRIPT used to leave *PERSISTED-COUNT* untouched, so the next
   REPL-PERSIST-TURN appended the WHOLE loaded history into the session again —
   duplicate events on every /load."
-  (let (msgs)
+  (let ((msgs nil) (bad 0))
     (with-open-file (i path :direction :input :external-format :utf-8)
-      (loop for line = (read-line i nil nil)
-            while line
-            for trimmed = (string-trim '(#\Return #\Space) line)
+      (loop for raw = (read-line i nil nil)
+            while raw
+            for trimmed = (string-trim '(#\Return #\Space #\Tab) (strip-bom raw))
             unless (string= trimmed "")
-              do (push (wire->message (agent-cl.core:decode-to-plist trimmed)) msgs)))
+              do (handler-case
+                     (let ((decoded (agent-cl.core:decode-to-plist trimmed)))
+                       ;; A JSON ARRAY root decodes to a list, and GETF on it then
+                       ;; signalled "malformed property list" straight out of the
+                       ;; REPL; anything that is not an event object is reported
+                       ;; and skipped instead of killing the command.
+                       (unless (and (listp decoded) (keywordp (first decoded)))
+                         (error "不是事件对象（期望 JSON object）"))
+                       (push (wire->message decoded) msgs))
+                   (error (e)
+                     (incf bad)
+                     (format t "~&[load] 跳过无法解析的内容：~a~%" e)))))
+    (when (plusp bad)
+      (format t "~&[load] 共跳过 ~a 处内容~%" bad))
     (setf msgs (sanitize-loaded-messages (nreverse msgs)))
     (setf (agent-cl.loop:agent-messages agent) msgs)
     ;; the imported history is now the agent's state, so record it as such:
@@ -543,6 +561,15 @@
     (repl-persist-turn agent)
     (format t "~&已载入 ~a 条消息（已写入当前会话 ~a）~%"
             (length msgs) (agent-cl.session:session-id *repl-session*))))
+
+(defun strip-bom (s)
+  "Drop a leading UTF-8 BOM. Files written by PowerShell 5.1 (Out-File -Encoding
+  utf8, or a plain redirect) carry one and READ-LINE does not strip it, so the
+  first line reached the JSON decoder with a ZERO WIDTH NO-BREAK SPACE in front of
+  it and died with a baffling CASE-FAILURE."
+  (if (and (plusp (length s)) (char= (char s 0) (code-char #xFEFF)))
+      (subseq s 1)
+      s))
 
 (defun clean-input-line (line)
   "Normalize one line of user input: strip surrounding whitespace including CR.
@@ -735,7 +762,8 @@
     (cond
       (shown
        (format t "~&已保存会话（共 ~a 个~@[，另有 ~a 个空会话未显示：/sessions all~]）：~%"
-               (length shown) (and (plusp hidden) hidden))
+               (length shown)
+               (and (not include-empty) (plusp hidden) hidden))
        (loop for (id ts n s) in shown for i from 1
              do (if s
                     (format t "  ~2d) ~a~%" i (repl-session-line s))
@@ -1252,20 +1280,27 @@
                    ;; the transient input row is erased at the next prompt, so
                    ;; copy the accepted line into the scrolling transcript
                    (when (footer-active-p) (footer-begin-output line))
-                   (if (char= (char line 0) #\/)
-                       (repl-command line agent)
-                       (handler-case
-                           (ask-turn agent line)
-                         (sb-sys:interactive-interrupt ()
-                           ;; Ctrl-C DURING A TURN interrupts the turn — which is
-                           ;; what the banner promises. It used to fall through to
-                           ;; the outer handler and quit the whole REPL, throwing
-                           ;; away a live session. Ctrl-C at the prompt (where
-                           ;; READ-LINE is waiting) still exits.
-                           (agent-cl.loop:stop agent)
-                           (flush-tokens)
-                           (format t "~&[repl] 已中断本轮（会话保留；在提示符处 Ctrl-C 退出）。~%")
-                           (repl-persist-turn agent)))))))))
+                   (handler-case
+                       (if (char= (char line 0) #\/)
+                           (repl-command line agent)
+                           (ask-turn agent line))
+                     (sb-sys:interactive-interrupt ()
+                       ;; Ctrl-C interrupts the WORK IN PROGRESS — a model turn
+                       ;; OR a long command such as /plan or /model — and keeps
+                       ;; the session. It used to cover model turns only and
+                       ;; otherwise fell through to the outer handler, which QUIT
+                       ;; the REPL and threw the conversation away.
+                       (agent-cl.loop:stop agent)
+                       (flush-tokens)
+                       (format t "~&[repl] 已中断（会话保留；在提示符处 Ctrl-C 退出）。~%")
+                       (repl-persist-turn agent))
+                     (error (e)
+                       ;; A failing slash command must NOT kill the session: any
+                       ;; error used to unwind out of the toplevel with a full
+                       ;; backtrace and exit 1 (reproduced with /export to a path
+                       ;; whose parent directory does not exist).
+                       (format t "~&[repl] 命令失败（会话继续）: ~a~%" e)
+                       (finish-output))))))))
       ;; always hand the terminal back, including on Ctrl-C, and drop the
       ;; session if the user never actually talked in it
       (footer-disable)

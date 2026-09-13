@@ -10,32 +10,58 @@
 ;;; ---------------------------------------------------------------------------
 
 (deftest memory-key-encoding-is-injective
-  "\"a b\" hex-escaped to \"a20b\", which collided with the literal key \"a20b\":
-  one memory silently overwrote the other. The escape introducer is escaped now."
-  (let ((a (agent-cl.tools::memory-key-stem "a b"))
-        (b (agent-cl.tools::memory-key-stem "a20b"))
-        (c (agent-cl.tools::memory-key-stem "a-b"))
-        (d (agent-cl.tools::memory-key-stem "a_b"))
-        (e (agent-cl.tools::memory-key-stem "a/b")))
-    (is-equal "a_20b" a)
-    (is-equal "a20b" b)
-    (is-equal "a-b" c)
-    (is-equal "a_5fb" d)
-    (is-equal "a_2fb" e)
-    ;; all distinct
-    (is-equal 5 (length (remove-duplicates (list a b c d e) :test #'string=)))))
+  "The escape must be SELF-DELIMITING. The first attempt at this used an
+  underscore plus a variable-length hex number, so the escape absorbed the literal
+  hex characters that followed it: the single character U+0100 and the two
+  characters 0x10 followed by zero both produced the same stem, and a brute force
+  over a 15-character alphabet found 31 collisions. Escapes are now an underscore
+  plus exactly 6 hex digits, and only [a-z] stays literal."
+  (let ((pairs (list (cons "a b" "a_000020b")
+                     (cons "a20b" "a_000032_000030b")
+                     (cons "a-b" "a_00002db")
+                     (cons "a_b" "a_00005fb")
+                     (cons "a/b" "a_00002fb")
+                     ;; the audit's collision pairs, now distinct
+                     (cons (string (code-char #x100)) "_000100")
+                     (cons (format nil "~c0" (code-char 16)) "_000010_000030")
+                     (cons (string (code-char #x4E2D)) "_004e2d")
+                     (cons "N2d" "_00004e_000032d"))))
+    (dolist (pair pairs)
+      (is-equal (cdr pair) (agent-cl.tools::memory-key-stem (car pair))
+                (format nil "stem of ~s" (car pair))))
+    ;; every one distinct
+    (let ((stems (mapcar (lambda (p) (agent-cl.tools::memory-key-stem (car p))) pairs)))
+      (is-equal (length stems) (length (remove-duplicates stems :test #'string=))))))
 
 (deftest memory-key-encoding-survives-case-and-devices
-  "Windows filenames are case-insensitive, so 'ABC' and 'abc' shared one file;
-  and a key like 'con' produced an unusable device name."
+  "NTFS is case-insensitive, so only lowercase letters may stay literal; reserved
+  device names get a prefix."
   (is-equal "abc" (agent-cl.tools::memory-key-stem "abc"))
-  (is-equal "_41_42_43" (agent-cl.tools::memory-key-stem "ABC"))
+  (is-equal "_000041_000042_000043" (agent-cl.tools::memory-key-stem "ABC"))
   (ok (not (string-equal (agent-cl.tools::memory-key-stem "ABC")
                          (agent-cl.tools::memory-key-stem "abc"))))
   (is-equal "_con" (agent-cl.tools::memory-key-stem "con"))
-  (is-equal "_5fcon" (agent-cl.tools::memory-key-stem "_con"))
+  (is-equal "_00005fcon" (agent-cl.tools::memory-key-stem "_con"))
   ;; empty key still maps to something usable
   (ok (plusp (length (agent-cl.tools::memory-key-stem "")))))
+  
+(deftest memory-key-injectivity-brute-force
+  "Exhaustive check over a mixed alphabet at lengths 0..3: no two distinct keys
+  may share a stem."
+  (let ((alphabet (coerce "ab019_Ā中" 'list))
+        (seen (make-hash-table :test 'equal))
+        (collisions 0))
+    (labels ((walk (prefix depth)
+               (let ((stem (agent-cl.tools::memory-key-stem prefix)))
+                 (let ((other (gethash stem seen)))
+                   (when (and other (not (string= other prefix)))
+                     (incf collisions)))
+                 (setf (gethash stem seen) prefix))
+               (when (< depth 3)
+                 (dolist (c alphabet)
+                   (walk (concatenate 'string prefix (string c)) (1+ depth))))))
+      (walk "" 0))
+    (is-equal 0 collisions "collisions in 585 keys")))
 
 (deftest memory-store-recall-roundtrip-keeps-distinct-keys
   "End to end over the real filesystem: two keys that used to collide must now

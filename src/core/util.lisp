@@ -267,6 +267,93 @@
              (string= c r :end1 (length r) :end2 (length r))
              (char= (char c (length r)) #\/)))))
 
+;; ---------------------------------------------------------------------------
+;; filesystem-level link detection
+;;
+;; Lexical folding is NOT confinement: a junction or symlink that lives inside
+;; the workspace resolves, at the OS level, to wherever it points. Verified on
+;; this machine: with the workspace root set to a directory containing a junction
+;; to C:\Windows, file.read "<root>/jlink/win.ini" returned win.ini and
+;; file.write through another junction wrote OUTSIDE the root. `cmd /c mklink /J`
+;; needs no administrator rights, and shell.run can create one.
+;; ---------------------------------------------------------------------------
+
+#+win32
+(sb-alien:define-alien-routine ("GetFileAttributesW" %get-file-attributes)
+    sb-alien:unsigned-long
+  (name (sb-alien:c-string :external-format :ucs-2)))
+
+(defparameter +invalid-file-attributes+ #xFFFFFFFF)
+(defparameter +file-attribute-reparse-point+ #x400)
+
+(defun windows-reparse-point-p (path)
+  "True when PATH exists and carries FILE_ATTRIBUTE_REPARSE_POINT (a junction, a
+  symlink, or an OneDrive-style placeholder is not)."
+  #+win32
+  (let ((attrs (%get-file-attributes (namestring path))))
+    (and (/= attrs +invalid-file-attributes+)
+         (plusp (logand attrs +file-attribute-reparse-point+))))
+  #-win32
+  (declare (ignore path))
+  #-win32
+  nil)
+
+(defun posix-symlink-p (path)
+  "True when PATH is a symbolic link (POSIX hosts). SB-POSIX is loaded on demand
+  so this costs nothing on platforms that never call it."
+  #-win32
+  (handler-case
+      (progn
+        (require "SB-POSIX")
+        (let ((lstat (find-symbol "LSTAT" "SB-POSIX"))
+              (islink (find-symbol "S-ISLNK" "SB-POSIX")))
+          (and lstat islink
+               (let ((st (funcall lstat (namestring path))))
+                 (and st (funcall islink st))))))
+    (error () nil))
+  #+win32
+  (declare (ignore path))
+  #+win32
+  nil)
+
+(defun reparse-point-p (path)
+  "True when PATH exists and is a link (Windows junction/symlink, POSIX symlink).
+  A link cannot be validated by string comparison, so the file tools refuse to
+  traverse one inside the workspace."
+  (if (uiop:os-windows-p)
+      (windows-reparse-point-p path)
+      (posix-symlink-p path)))
+
+(defun path-exists-p (path)
+  "True when PATH exists as a file OR a directory. UIOP:FILE-EXISTS-P excludes
+  directories, so a junction (which is a directory) looked non-existent and was
+  skipped by the link check — verified while fixing exactly that bug."
+  (or (uiop:file-exists-p path)
+      (uiop:directory-exists-p path)))
+
+(defun first-link-under-root (canonical root-canon)
+  "The first EXISTING component of CANONICAL that sits strictly BELOW ROOT-CANON
+  and is a link, or NIL.
+
+  Components at or above the root are not inspected: reaching the workspace
+  through a link is the user's own choice, but nothing INSIDE it may be one, or
+  the confinement guarantee would depend on the machine's link layout."
+  (let* ((root (if (and (plusp (length root-canon))
+                        (char= (char root-canon (1- (length root-canon))) #\/))
+                   root-canon
+                   (concatenate 'string root-canon "/")))
+         (rest (if (and (>= (length canonical) (length root))
+                        (string= root canonical
+                                 :end1 (length root) :end2 (length root)))
+                   (subseq canonical (length root))
+                   ;; not under the root: the lexical check reports that
+                   nil)))
+    (loop with acc = (string-right-trim "/" root)
+          for seg in (and rest (uiop:split-string rest :separator '(#\/)))
+          for candidate = (setf acc (format nil "~a/~a" acc seg))
+          when (and (path-exists-p candidate) (reparse-point-p candidate))
+            return candidate)))
+
 (defun format-token-count (n)
   "Compact token count for display: <1000 as-is, then 1.2k, then 1.2M.
   Rounds to one decimal; drops a trailing '.0'. Non-numbers -> \"?\". Pure."

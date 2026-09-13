@@ -76,6 +76,8 @@
    (:file "sse-tests")
    (:file "engine-tests")
    (:file "wire-hardening-tests")
+   (:file "audit-round2-tests")
+   (:file "audit-round3-tests")
    (:file "dsl-tests")
    (:file "dsl-hardening-tests")
    (:file "session-tests")

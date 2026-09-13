@@ -19,15 +19,25 @@
 (defvar *fail-count* 0)
 (defvar *current-name* nil)
 (defvar *local-fail* nil)
+(defvar *assert-count* 0
+  "Assertions made by the running test. A test that makes NONE is reported as a
+  failure: two such 'tests' existed (a bare cleanup form and a tautology like
+  (is-equal \"X\" \"X\")), and both were counted as passes forever.")
 
 (defmacro deftest (name &body body)
-  "Register a named test. BODY may use OK, IS-EQUAL, SIGNALS-ERROR."
+  "Register a named test. BODY may use OK, IS-EQUAL, SIGNALS-ERROR.
+  A BODY that performs no assertion FAILS: silence is not evidence."
   (let ((n (string-downcase (string name))))
     `(progn
-       (setf (gethash ,n *tests*) (lambda () (let ((*local-fail* nil))
-                                               ,@body
-                                               (unless *local-fail*
-                                                 (incf *pass-count*)))))
+       (setf (gethash ,n *tests*)
+             (lambda ()
+               (let ((*local-fail* nil)
+                     (*assert-count* 0))
+                 ,@body
+                 (cond ((zerop *assert-count*)
+                        (note-failure "test made no assertions"))
+                       ((not *local-fail*)
+                        (incf *pass-count*))))))
        (pushnew ,n *order* :test #'string=)
        ',name)))
 
@@ -39,23 +49,26 @@
 
 (defmacro ok (form &optional (message nil))
   "Assert FORM evaluates true."
-  `(unless ,form
-     (note-failure (or ,message ,(format nil "~s is false" form)))))
+  `(progn (incf *assert-count*)
+          (unless ,form
+            (note-failure (or ,message ,(format nil "~s is false" form))))))
 
 (defmacro is-equal (expected form &optional (message nil))
   "Assert (equal EXPECTED FORM)."
-  `(let ((got ,form))
-     (unless (equal ,expected got)
-       (note-failure (format nil "expected ~s but got ~s~@[ — ~a~]"
-                             ,expected got ,message)))))
+  `(progn (incf *assert-count*)
+          (let ((got ,form))
+            (unless (equal ,expected got)
+              (note-failure (format nil "expected ~s but got ~s~@[ — ~a~]"
+                                    ,expected got ,message))))))
 
 (defmacro signals-error (condition-type &body body)
   "Assert BODY signals CONDITION-TYPE (or a subtype of it)."
-  `(handler-case
-       (progn ,@body
-         (note-failure (format nil "expected ~s to signal, but it returned"
-                               ',condition-type)))
-     (,condition-type () t)))
+  `(progn (incf *assert-count*)
+          (handler-case
+              (progn ,@body
+                     (note-failure (format nil "expected ~s to signal, but it returned"
+                                           ',condition-type)))
+            (,condition-type () t))))
 
 (defun run-one (name)
   (let ((fn (gethash name *tests*)))

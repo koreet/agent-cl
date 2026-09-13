@@ -35,10 +35,19 @@
       (let ((key (first cl)) (val (rest cl)))
         (case key
           (:check (setf check val))                     ; body forms, agent bound
-          ((:applies-to :governed-by)
+          (:applies-to
+           ;; :applies-to names TOOLS (a pre-execution scope); :governed-by only
+           ;; records a reference, like every other DSL form. Merging them made
+           ;; (:governed-by some-principle) install a tool guard for a tool that
+           ;; does not exist and corrupted the declared scope.
            (setf applies (append applies (copy-list val)))
            (setf refs (append refs (copy-list val))))
+          (:governed-by (setf refs (append refs (copy-list val))))
           ((:on-violation :evidence)
+           (unless (= (length val) 1)
+             ;; (:on-violation :block :extra) used to pass validation and then
+             ;; expand into a call of the keyword :BLOCK
+             (error "defaudit: ~a takes exactly one value; got ~s" key val))
            (when (and (eq key :on-violation)
                       (not (member (first val) *audit-on-violation-values*)))
              (error "defaudit: :on-violation must be one of ~s; got ~s"
@@ -47,8 +56,15 @@
           (:intent
            ;; stored as DATA (quoted at expansion): an intent is documentation,
            ;; so it must never be evaluated as code.
-           (setf spec (append spec (list key (if (= (length val) 1) (first val) val)))))
-          (otherwise (setf spec (append spec (list key (if (= (length val) 1) (first val) val))))))))
+           (unless (= (length val) 1)
+             (error "defaudit: ~a takes exactly one value; got ~s" key val))
+           (setf spec (append spec (list key (first val)))))
+          (otherwise
+           ;; An unknown clause used to be accepted and then silently dropped
+           ;; ("(:severity :high)" vanished), which contradicts this parser's
+           ;; promise to reject what it cannot honour.
+           (error "defaudit: unknown clause ~s (expected :applies-to :governed-by :check :on-violation :evidence :intent)"
+                  key)))))
     (values check applies refs spec)))
 
 (defmacro defaudit (name &body clauses)
@@ -72,7 +88,12 @@
       (let ((on-violation (or (getf spec :on-violation) :block)))
         `(progn
            (defun ,name (,agent-sym) ,@check)
-           (agent-cl.loop:register-guard ,rule-name #',name)
+           ;; Only a BLOCKING rule becomes a global guard. Registering every rule
+           ;; meant a :warn rule also stopped the turn at the next step check, so
+           ;; the documented "run it and annotate the result" outcome was
+           ;; unreachable (reproduced).
+           ,@(when (eq on-violation :block)
+               `((agent-cl.loop:register-guard ,rule-name #',name)))
            ,@(mapcar (lambda (target)
                        ;; adapter: the rule predicate takes (agent); the tool
                        ;; guard protocol passes (agent tool args)

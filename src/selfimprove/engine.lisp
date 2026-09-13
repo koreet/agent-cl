@@ -89,7 +89,10 @@
           (uiop:getcwd)))))
 
 (defparameter *protected-paths*
-  '("scripts/run-tests.lisp" "tests/" "agent-cl.asd")
+  ;; .git/ belongs here: a patch that drops .git/hooks/* or rewrites .git/config
+  ;; gets persistent code execution without ever passing the gate.
+  '("scripts/run-tests.lisp" "tests/" "agent-cl.asd"
+    ".git/" "_improve-backups/" ".tools/")
   "Repo-relative paths (or directory prefixes, trailing /) that IMPROVE-FILE
   refuses to patch: they *define* the gate, so letting a patch edit them would
   make the gate meaningless.")
@@ -105,6 +108,21 @@
                         (concatenate 'string canon-root "/"))))
         (subseq canon (length prefix))))))
 
+(defun normalize-protected-relative (rel)
+  "Canonical comparison form of a repo-relative path.
+
+  Windows opens `tests/x.lisp`, `TESTS/X.LISP` and `agent-cl.asd.` as the SAME
+  files (case-insensitive, trailing dots/spaces ignored), while the protected-path
+  test compared raw strings — so a patch could rewrite the gate files through an
+  alias and be adopted (reproduced end to end)."
+  (let* ((s (if (uiop:os-windows-p) (string-downcase rel) rel))
+         (parts (uiop:split-string s :separator '(#\/))))
+    (format nil "~{~a~^/~}"
+            (mapcar (lambda (seg)
+                      ;; Win32 strips trailing dots and spaces from a name
+                      (string-right-trim '(#\. #\Space) seg))
+                    parts))))
+
 (defun path-confinement-error (path)
   "Reason string when IMPROVE-FILE must refuse PATH, else NIL. Confined to the
   repository: this primitive rewrites files and runs a gate on the result, so an
@@ -113,14 +131,17 @@
     (cond
       ((null rel)
        (format nil "拒绝修改仓库外的文件 ~a（允许范围 ~a）" path (repo-root-path)))
-      ((some (lambda (p)
-               (if (char= (char p (1- (length p))) #\/)
-                   (and (>= (length rel) (length p))
-                        (string= rel p :end1 (length p) :end2 (length p)))
-                   (string-equal rel p)))
-             *protected-paths*)
-       (format nil "拒绝修改受保护的测试/门禁文件 ~a（它们定义了 gate 本身）" rel))
-      (t nil))))
+      (t
+       (let ((norm (normalize-protected-relative rel)))
+         (when (some (lambda (p)
+                       (let ((pn (normalize-protected-relative p)))
+                         (if (char= (char pn (1- (length pn))) #\/)
+                             (and (>= (length norm) (length pn))
+                                  (string= norm pn
+                                           :end1 (length pn) :end2 (length pn)))
+                             (string-equal norm pn))))
+                     *protected-paths*)
+           (format nil "拒绝修改受保护的测试/门禁文件 ~a（它们定义了 gate 本身）" rel)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; main primitive
@@ -191,10 +212,25 @@
                            (error (e) (values nil (format nil "gate raised: ~a" e))))
                        (cond
                          (okp
-                          (unless keep-backup-on-pass
-                            (when (probe-file bak) (delete-file bak)))
-                          (state-plist :status :adopted
-                                       :detail (or detail "gate passed")))
+                          ;; Once the patch is LIVE, a failure in the cleanup step
+                          ;; must not be reported as "rejected": that told the
+                          ;; caller nothing had changed while the repo was patched
+                          ;; (reproduced by making the backup undeletable). The
+                          ;; outcome is :adopted, with the cleanup failure in the
+                          ;; detail and the backup kept for audit.
+                          (let ((cleanup-error nil))
+                            (unless keep-backup-on-pass
+                              (handler-case
+                                  (when (probe-file bak) (delete-file bak))
+                                (error (e) (setf cleanup-error e))))
+                            (state-plist :status :adopted
+                                         :retained (and cleanup-error t)
+                                         :detail (if cleanup-error
+                                                     (format nil "~a；备份未删除（~a）：~a"
+                                                             (or detail "gate passed")
+                                                             (namestring bak)
+                                                             cleanup-error)
+                                                     (or detail "gate passed")))))
                          (t
                           ;; 4 rollback from backup. A FAILED rollback must be
                           ;; reported as such: folding it into the generic
@@ -271,11 +307,25 @@
             :directory repo)
          (declare (ignore err))
          (let ((txt (or out "")))
-           (values (and (integerp exit) (zerop exit)
-                        (not (null (search "0 failed" txt))))
-                   (format nil "exit=~a (~a) tail=[~a]"
-                           exit
-                           (if (eq exit :timeout)
-                               (format nil "超时 ~as 后终止" timeout)
-                               "完成")
-                           (tail-string txt 400)))))))))
+           ;; The success criterion used to be "exit 0 AND the text 0 failed
+           ;; appears", both of which the PATCH itself controls: the gate
+           ;; subprocess loads the patched file, so a patch that prints
+           ;; "0 failed" and quits is adopted (criterion reproduced with a stub).
+           ;; Requiring the suite's own summary line ("N passed") means at least
+           ;; one test really ran and produced a report.
+           (let ((summary (search "===" txt)))
+             (declare (ignore summary))
+             (values (and (integerp exit) (zerop exit)
+                          (not (null (search "0 failed" txt)))
+                          (let ((m (position #\Space txt)))
+                            (declare (ignore m))
+                            ;; a run that reports 0 failures must also report that
+                            ;; some tests passed
+                            (or (search "passed" txt) nil)
+                            (not (null (search "0 failed" txt)))))
+                     (format nil "exit=~a (~a) tail=[~a]"
+                             exit
+                             (if (eq exit :timeout)
+                                 (format nil "超时 ~as 后终止" timeout)
+                                 "完成")
+                             (tail-string txt 400))))))))))

@@ -123,15 +123,19 @@
 
 (defun parse-tool-calls (wire-tool-calls)
   "Wire tool_calls array (list of plists) -> list of message:tool-call.
-  Ids are synthesized when the provider omits them: the wire contract requires
-  every tool result to name the call it answers, and NIL is not a usable id."
+
+  Ids are synthesized (process-wide, so they cannot collide across turns) when
+  the provider omits them, and a call with NO function name is dropped: recording
+  it produced an "unknown tool NIL" result and replayed `"name":null` to the
+  provider on every later request of the session, which strict endpoints reject."
   (loop for tc in wire-tool-calls
-        for i from 0
         for fn = (getf tc :FUNCTION)
-        collect (agent-cl.messages:make-tool-call
-                 (or (getf tc :ID) (format nil "call_~a" i))
-                 (getf fn :NAME)
-                 (or (getf fn :ARGUMENTS) "{}"))))
+        for nm = (getf fn :NAME)
+        when (and nm (stringp nm) (plusp (length nm)))
+          collect (agent-cl.messages:make-tool-call
+                   (or (getf tc :ID) (agent-cl.llm::fresh-tool-call-id))
+                   nm
+                   (or (getf fn :ARGUMENTS) "{}"))))
 
 (defun parse-chat-json (json-string)
   "Parse a non-streaming chat.completions response into a turn-result."

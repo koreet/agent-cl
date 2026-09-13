@@ -234,13 +234,30 @@
           (gethash "include_answer" ht) yason:false)
     (agent-cl.core:json-encode ht)))
 
+(defun safe-text (value)
+  "Printable, control-character-free text for a provider-supplied field.
+
+  Provider data is untrusted. A non-string value (a number, a cons) used to raise
+  inside the caller's handler, so a SUCCESSFUL search was reported as
+  \"检索失败: The value 42 is not of type SEQUENCE\" and the good results were
+  dropped (and not cached, so a retry spent quota again). ESC/C0 characters are
+  stripped as well: a title carrying them reached the terminal and the log
+  (OSC-52 clipboard writes, title spoofing, cursor control)."
+  (let ((s (typecase value
+             (null "")
+             (string value)
+             (t (princ-to-string value)))))
+    (string-trim '(#\Space #\Tab #\Newline #\Return)
+                 (remove-if (lambda (c) (< (char-code c) 32)) s))))
+
 (defun format-results (results)
   "Render decoded Tavily results (a list of plists) as the agent-facing text:
   one title-and-url line per result, with the snippet indented beneath when
   present."
   (format nil "~{~a~^~%~}"
           (loop for r in results
-                for title = (or (getf r :TITLE) "(无标题)")
+                for title = (let ((t1 (safe-text (getf r :TITLE))))
+                              (if (plusp (length t1)) t1 "(无标题)"))
                 for url = (or (getf r :URL) "")
                 for content = (getf r :CONTENT)
                 collect (with-output-to-string (o)
@@ -306,7 +323,11 @@
     (get-output-stream-string out)))
 
 (defun cache-key (backend query max)
-  (list backend (normalize-query query) max))
+  ;; the BACKEND is normalized too: "tavily", "Tavily" and "TAVILY" used to be
+  ;; three separate cache entries AND three separate billable requests.
+  (list (string-downcase (string-trim '(#\Space #\Tab) (or backend "")))
+        (normalize-query query)
+        max))
 
 (defun cache-lookup (key)
   "Cached results for KEY when still fresh, else NIL (expired entries drop)."
@@ -436,7 +457,10 @@
   "Backend-agnostic rendering of RESULTS into the agent-facing text."
   (if (string-equal backend "ddg")
       (format nil "~{~a - ~a~%~}"
-              (loop for (t1 . u) in results append (list t1 u)))
+              (loop for pair in results
+                    for t1 = (safe-text (car pair))
+                    for u = (safe-text (cdr pair))
+                    append (list t1 u)))
       (format-results results)))
 
 (defun search-backend-ready-p (backend)

@@ -129,9 +129,17 @@
 (deftest terminal-probe-console-never-throws
   ;; The test runner's stdout is usually redirected (no console) -> NIL. Either
   ;; way the probe must not signal, and any answer it does give must be sane.
+  ;;
+  ;; NB: every assertion here used to sit inside (when info ...), so on the very
+  ;; path this test runs under — redirected output, i.e. NO console — it asserted
+  ;; nothing at all and passed vacuously.
   (let ((info (agent-cl.render:probe-console)))
+    (ok (or (null info)
+            (and (listp info)
+                 (integerp (getf info :cols)) (plusp (getf info :cols))
+                 (integerp (getf info :rows)) (plusp (getf info :rows))))
+        "the probe returns NIL or a well-formed (:cols C :rows R ...) plist")
+    ;; A reported console must carry the VT flag; NIL is the documented "do not
+    ;; pin a footer" signal, which is what a redirected stream must produce.
     (when info
-      (ok (integerp (getf info :cols)) "cols is an integer")
-      (ok (integerp (getf info :rows)) "rows is an integer")
-      (ok (plusp (getf info :cols)) "cols is positive")
-      (ok (plusp (getf info :rows)) "rows is positive"))))
+      (ok (getf info :vt) "a reported console carries the VT flag"))))

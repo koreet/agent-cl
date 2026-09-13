@@ -46,16 +46,28 @@
 (defun workspace-resolve (path)
   "Resolve PATH for the file tools. Returns (values CANONICAL-PATH NIL) when it
   is inside the workspace, else (values NIL REASON). Callers must OPEN the
-  returned canonical path, so that what was validated is what gets used."
+  returned canonical path, so that what was validated is what gets used.
+
+  TWO checks, because string folding alone is not confinement:
+    1. lexical — the folded path must sit under the root;
+    2. filesystem — no component below the root may be a junction/symlink, since
+       the OS would then resolve the path wherever the link points."
   (if (null *file-workspace-root*)
       (values (agent-cl.core:canonical-path-string path (uiop:getcwd)) nil)
-      (let ((root (canonical-path-string *file-workspace-root*))
-            (cand (canonical-path-string path)))
-        (if (agent-cl.core:path-inside-p cand root)
-            (values cand nil)
-            (values nil
-                    (format nil "拒绝访问工作区外路径 ~a（允许范围 ~a；如需放开请 set-file-workspace-root nil）"
-                            path root))))))
+      (let* ((root (canonical-path-string *file-workspace-root*))
+             (cand (canonical-path-string path)))
+        (cond
+          ((not (agent-cl.core:path-inside-p cand root))
+           (values nil
+                   (format nil "拒绝访问工作区外路径 ~a（允许范围 ~a；如需放开请 set-file-workspace-root nil）"
+                           path root)))
+          (t
+           (let ((link (agent-cl.core:first-link-under-root cand root)))
+             (if link
+                 (values nil
+                         (format nil "拒绝访问：路径经过链接/junction ~a（链接可以指向工作区外，字符串校验无法穿越它）"
+                                 link))
+                 (values cand nil))))))))
 
 (defun workspace-check (path)
   "Compatibility wrapper: an error string when PATH leaves the workspace, else
@@ -386,31 +398,34 @@
 (defun memory-key-stem (key)
   "Injective, filesystem-safe filename stem for KEY.
 
-  Injectivity is the whole point: the previous scheme hex-escaped other
-  characters WITHOUT escaping the escape, so the key \"a b\" produced \"a20b\" and
-  collided with the literal key \"a20b\" — one memory silently overwrote the
-  other. Here '_' is the escape introducer and is itself escaped:
-      [a-z0-9-]  -> itself
-      '_'        -> \"_5f\"
-      anything   -> \"_\" + 2 lowercase hex digits
-  Lowercase-only is deliberate: Windows filenames are case-insensitive, so
-  \"ABC\" and \"abc\" would otherwise share one file. Reserved device names get a
-  '_' prefix (a literal leading '_' is already escaped, so this adds no new
-  collision)."
+  Injectivity is the whole point — two distinct keys mapping to one file means one
+  memory silently answers for the other — and it was BROKEN: the escape was
+  `_` + a variable-length hex number, so the escape absorbed the literal hex
+  characters that followed it (key \"Ā\" U+0100 and key <0x10>\"0\" both produced
+  \"_100\"; a brute force over a 15-character alphabet found 31 collisions).
+  The escape is therefore SELF-DELIMITING: `_` + exactly 6 hex digits, which
+  covers every code point, and every literal numeric character is escaped too, so
+  an escape can never be confused with text:
+
+      [a-z]      -> itself          (lowercase only: NTFS is case-insensitive)
+      everything -> \"_\" + 6 lowercase hex digits
+
+  Keys whose stem would exceed the filesystem's name budget are hashed rather
+  than truncated (truncation would re-introduce collisions)."
   (let* ((s (if (stringp key) key (princ-to-string key)))
          (stem (with-output-to-string (out)
                  (loop for ch across s
-                       do (if (or (char<= #\a ch #\z)
-                                  (digit-char-p ch)
-                                  (char= ch #\-))
+                       do (if (char<= #\a ch #\z)
                               (write-char ch out)
-                              ;; ~(...~) forces lower case: SBCL prints ~x in
-                              ;; upper case, so relying on the directive's case
-                              ;; made 'a_b' encode differently per implementation.
-                              (format out "_~(~2,'0x~)" (char-code ch)))))))
-    (cond ((zerop (length stem)) "_")
+                              (format out "_~(~6,'0x~)" (char-code ch)))))))
+    (cond ((zerop (length stem)) "_000000")
           ((member stem *reserved-filenames* :test #'string-equal)
            (concatenate 'string "_" stem))
+          ;; 255 is the usual filename limit; leave room for ".json"
+          ((> (length stem) 200)
+           (format nil "k~(~8,'0x~)-~a"
+                   (logand (sxhash s) #xFFFFFFFF)
+                   (subseq stem 0 160)))
           (t stem))))
 
 (defun memory-key-file (key)
@@ -418,11 +433,11 @@
   (merge-pathnames (format nil "~a.json" (memory-key-stem key)) (memory-dir)))
 
 (defun legacy-memory-key-file (key)
-  "The pre-fix filename for KEY: a read-only fallback so memories written by an
-  older build stay recallable. New writes always use MEMORY-KEY-FILE.
+  "The PRE-FIX filename for KEY, kept as a read-only fallback so memories written
+  by an older build stay recallable. New writes always use MEMORY-KEY-FILE.
 
-  NB: its output (including the hex CASE) must not be modernised — this exists to
-  match file names that are already on disk."
+  NB: its output (including the hex CASE, which depended on the implementation's
+  ~x behaviour) must not be modernized — it exists to match names already on disk."
   (let* ((s (if (stringp key) key (princ-to-string key)))
          (safe (with-output-to-string (out)
                  (loop for ch across s
@@ -434,7 +449,7 @@
 
 (defun legacy-memory-key-candidates (key)
   "Legacy paths for KEY: the historical name plus its case-folded variant, since
-  the hex case depended on the implementation's ~x behavior."
+  the hex case depended on the implementation's ~x behaviour."
   (let* ((f (legacy-memory-key-file key))
          (dir (memory-dir))
          (name (file-namestring f))
@@ -473,9 +488,20 @@
       (cond
         ((uiop:file-exists-p f)
          (values (agent-cl.core:read-file-string f) :ok))
-        ;; memories written before the encoding was made injective
-        ((find-if #'uiop:file-exists-p old)
-         (values (agent-cl.core:read-file-string (find-if #'uiop:file-exists-p old))
+        ;; Memories written before the encoding was made injective. The legacy
+        ;; name is only consulted when the NEW name of a DIFFERENT key does not
+        ;; already own that file — otherwise `recall "a20b"` would return the value
+        ;; stored under `"a b"` by an older build.
+        ((find-if (lambda (cand)
+                    (and (uiop:file-exists-p cand)
+                         (not (string-equal (namestring cand) (namestring f)))))
+                  old)
+         (values (agent-cl.core:read-file-string
+                  (find-if (lambda (cand)
+                             (and (uiop:file-exists-p cand)
+                                  (not (string-equal (namestring cand)
+                                                     (namestring f)))))
+                           old))
                  :ok))
         (t (values (format nil "no memory for ~a" key) :error))))))
 

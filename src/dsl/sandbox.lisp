@@ -64,23 +64,42 @@
        (name-in sym (mapcar #'symbol-name *dsl-command-whitelist*))))
 
 (defun resolve-fn (sym)
-  "Resolve SYM to a function object, falling back to the CL symbol of the
-  same name (whitelist names are package-agnostic)."
-  (or (and (fboundp sym) (symbol-function sym))
-      (let ((cl-sym (find-symbol (symbol-name sym) :cl)))
-        (and cl-sym (fboundp cl-sym) (symbol-function cl-sym)))))
+  "Resolve a whitelisted name to its function object.
+
+  Resolution goes through the CL package ONLY. Preferring the caller-visible
+  binding meant a host package that shadows a whitelisted name (say EVIL::LIST)
+  reached its own function through the sandbox — reproduced: the shadowing
+  function ran and wrote a file. Every whitelist entry is a CL function, so there
+  is no legitimate reason to consult the caller's binding."
+  (let ((cl-sym (find-symbol (symbol-name sym) :cl)))
+    (and cl-sym (fboundp cl-sym) (symbol-function cl-sym))))
 
 (defun dsl-value-size (value limit)
-  "Approximate element count of VALUE (list elements, string/vector length),
-  giving up at LIMIT so this measurement can never itself be the bomb. Walks
-  lists with a step counter, so a circular list cannot hang the check."
+  "Approximate element count of VALUE (list elements, string/vector length).
+
+  Returns LIMIT+1 as soon as VALUE is known to exceed LIMIT, so a caller can
+  decide 'too big' with a single > comparison — the previous version SATURATED at
+  LIMIT, which made the argument cap impossible to trigger (an argument of exactly
+  the limit measured as the limit, never more).
+
+  A CIRCULAR list is rejected outright: walking it never terminates, and
+  (dsl-eval-safe '(length (quote #1=(a . #1#)))) hung the whole process (>120 s,
+  not even SB-EXT:WITH-TIMEOUT could break it). Floyd's tortoise/hare detects a
+  cycle in O(1) space."
   (cond
-    ((or (stringp value) (vectorp value)) (length value))
+    ((or (stringp value) (vectorp value)) (min (length value) (1+ limit)))
     ((consp value)
-     (let ((n 0) (tail value))
-       (loop while (and (consp tail) (< n limit))
-             do (incf n) (setf tail (cdr tail)))
-       n))
+     (let ((n 0) (tail value) (hare value))
+       (loop while (and (consp tail) (<= n limit))
+             do (incf n)
+                (setf tail (cdr tail))
+                (when (evenp n) (setf hare (cdr hare)))
+                (when (eq tail hare)
+                  (error 'agent-cl.core:dsl-error :kind :limit
+                         :message "dsl 拒绝环形/循环结构参数（拒绝遍历）")))
+       ;; >LIMIT and still conses left => report LIMIT+1 (definitely too big);
+       ;; otherwise N is the real length (an improper tail is not counted)
+       (if (and (> n limit) (consp tail)) (1+ limit) n)))
     (t 1)))
 
 (defvar *dsl-size-argument-ops*
@@ -100,7 +119,7 @@
         (error 'agent-cl.core:dsl-error :kind :limit
                :message (format nil "dsl 拒绝超大整数参数 ~a（上限 ~a）"
                                 a *dsl-max-integer*)))
-      (incf total (dsl-value-size a (- *dsl-max-sequence* total)))
+      (incf total (dsl-value-size a (max 0 (- *dsl-max-sequence* total))))
       (when (> total *dsl-max-sequence*)
         (error 'agent-cl.core:dsl-error :kind :limit
                :message (format nil "dsl 参数总量超过 ~a（~a）"
@@ -122,8 +141,13 @@
     ((null form) nil)
     ((eq form t) t)
     ((or (numberp form) (stringp form) (characterp form)) form)
+    ;; keywords are self-evaluating constants, so they are safe as arguments. They
+    ;; used to be denied as 'bare symbols', which made every whitelisted function
+    ;; with keyword parameters unusable: (make-string 3 :initial-element #\\x)
+    ;; was rejected and make-string could only produce NUL-filled strings.
+    ((keywordp form) form)
     ((symbolp form)
-     ;; bare symbols only make sense as constants — deny everything else
+     ;; other bare symbols only make sense as constants — deny everything else
      (dsl-denied form))
     ((atom form) form)
     ((eq (car form) 'quote) (second form))

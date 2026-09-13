@@ -44,6 +44,9 @@
    #:path-segments
    #:canonical-path-string
    #:path-inside-p
+   #:reparse-point-p
+   #:first-link-under-root
+   #:path-exists-p
    #:format-token-count))
 
 (defpackage #:agent-cl.messages

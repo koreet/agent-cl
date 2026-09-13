@@ -124,7 +124,13 @@
   so schema property names must follow the same rule or validation silently
   misses underscores names (required always reported missing, type checks
   skipped)."
-  (let* ((s (if (symbolp name) (symbol-name name) name))
+  ;; TOTAL function: a decoded JSON key can be a number, a cons or NIL when the
+  ;; model sends an ARRAY where an object is expected ("arguments": "[1,2]").
+  ;; SIGNALING here escaped validation (which runs before CALL-TOOL's
+  ;; handler-case) and aborted the whole turn with a type error.
+  (let* ((s (cond ((symbolp name) (symbol-name name))
+                  ((stringp name) name)
+                  (t (princ-to-string name))))
          (kebab (substitute #\- #\_ s)))
     (intern (string-upcase kebab) :keyword)))
 

@@ -22,17 +22,33 @@
 
 (deftest web-tavily-key-order
   ;; an explicit key wins over the environment
-  (let ((old (uiop:getenv "TAVILY_API_KEY")))
+  (let ((old (uiop:getenv "TAVILY_API_KEY"))
+        (keyfile (merge-pathnames "test-web-key-order.txt"
+                                  (uiop:temporary-directory))))
     (unwind-protect
          (progn
            (sb-posix:setenv "TAVILY_API_KEY" "ENVKEY" 1)
            (is-equal "EXPLICIT" (agent-cl.web:tavily-key "EXPLICIT"))
            (is-equal "ENVKEY" (agent-cl.web:tavily-key nil))
            (is-equal "ENVKEY" (agent-cl.web:tavily-key ""))
-           ;; an empty explicit value must fall through, not win
+           ;; An empty explicit value must fall through, not win. This assertion
+           ;; used to be a tautology — (is-equal "X" "X") — which passed forever
+           ;; while proving nothing. *TAVILY-KEY-FILE* is bound so the fallback
+           ;; chain is deterministic regardless of the developer's real key file.
+           (with-open-file (s keyfile :direction :output :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (write-string "FILEKEY" s))
            (sb-posix:setenv "TAVILY_API_KEY" "" 1)
-           (is-equal "ENVKEY-PLACEHOLDER-DOES-NOT-APPLY"
-                     "ENVKEY-PLACEHOLDER-DOES-NOT-APPLY"))
+           (let ((agent-cl.web:*tavily-key-file* keyfile))
+             (is-equal "FILEKEY" (agent-cl.web:tavily-key ""))
+             (is-equal "FILEKEY" (agent-cl.web:tavily-key nil))
+             (is-equal "EXPLICIT" (agent-cl.web:tavily-key "EXPLICIT")))
+           ;; no explicit, no env, no key file -> NIL (caller must report how to set one)
+           (let ((agent-cl.web:*tavily-key-file* (merge-pathnames "absent-key.txt"
+                                                                  (uiop:temporary-directory))))
+             (is-equal nil (agent-cl.web:tavily-key ""))
+             (is-equal nil (agent-cl.web:tavily-key nil))))
+      (ignore-errors (delete-file keyfile))
       (if old
           (sb-posix:setenv "TAVILY_API_KEY" old 1)
           (sb-posix:unsetenv "TAVILY_API_KEY")))))

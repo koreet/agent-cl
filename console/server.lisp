@@ -39,6 +39,14 @@
                     (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME")))))
 
 (defun json-quote (s)
+  "S as a JSON string literal.
+
+  EVERY character below 0x20 must be escaped (RFC 8259). Only quote, backslash,
+  LF, TAB and CR were handled, so a form-feed, NUL or ESC — exactly what this repo
+  captures from subprocesses, and what a user can paste into the chat box — was
+  written raw and made the whole response body invalid (reproduced: the browser's
+  JSON.parse rejected it, and /api/sessions would break for every client if one
+  session directory name contained such a character)."
   (with-output-to-string (o)
     (write-char #\" o)
     (loop for c across (if (stringp s) s (princ-to-string s)) do
@@ -48,7 +56,10 @@
         (#\Newline (write-string "\\n" o))
         (#\Tab (write-string "\\t" o))
         (#\Return (write-string "\\r" o))
-        (otherwise (write-char c o))))
+        (otherwise
+         (if (< (char-code c) 32)
+             (format o "\\u~(~4,'0x~)" (char-code c))
+             (write-char c o)))))
     (write-char #\" o)))
 
 (defun session-ids ()
@@ -87,19 +98,29 @@
         (with-output-to-string (o)
           (write-char #\[ o)
           (let ((first t))
-            (with-open-file (in f :external-format :utf-8)
-              (loop for line = (read-line in nil nil) while line do
-                (let ((trimmed (string-trim '(#\Return #\Space) line)))
-                  (unless (string= trimmed "")
-                    (handler-case
-                        (let ((json (agent-cl.core:json-encode
-                                     (agent-cl.core:json-decode trimmed))))
-                          (unless first (write-char #\, o))
-                          (write-string json o)
-                          (setf first nil))
-                      (error (e)
-                        (format t "~&[console] skip bad event line in ~a: ~a~%" id e)))))))
-          (write-char #\] o)))))))
+            ;; LENIENT decode + a guard around open/read: probe-file is not a
+            ;; readability test (a directory, a sharing violation), and a single
+            ;; stray byte used to raise a :UTF-8 decoding error out of the handler
+            ;; and return HTTP 500 — after which the page silently rendered an
+            ;; empty transcript. agent-cl.core:read-file-lenient is the same
+            ;; helper the session store uses for exactly this reason.
+            (handler-case
+              (with-open-file (in f :external-format :utf-8)
+                (loop for line = (read-line in nil nil) while line do
+                  (let ((trimmed (string-trim '(#\Return #\Space) line)))
+                    (unless (string= trimmed "")
+                      (handler-case
+                          (let ((json (agent-cl.core:json-encode
+                                       (agent-cl.core:json-decode trimmed))))
+                            (unless first (write-char #\, o))
+                            (write-string json o)
+                            (setf first nil))
+                        (error (e)
+                          (format t "~&[console] skip bad event line in ~a: ~a~%"
+                                  id e)))))))
+              (error (e)
+                (format t "~&[console] cannot read session ~a: ~a~%" id e))))
+          (write-char #\] o))))))
 
 (define-easy-handler (home :uri "/") ()
   (setf (content-type*) "text/html; charset=utf-8")
@@ -143,6 +164,14 @@
 
 (defparameter *server* nil)
 (defun server-up () (and *server* (hunchentoot:started-p *server*)))
+(let ((probe (ignore-errors
+              (usocket:socket-listen "127.0.0.1" *port* :reuse-address nil
+                                                       :element-type '(unsigned-byte 8)))))
+  (if probe
+      (ignore-errors (usocket:socket-close probe))
+      (progn (format t "~&[console] 端口 ~a 已被占用：另一个实例可能正在运行（本进程退出）~%" *port*)
+             (finish-output)
+             (sb-ext:quit :unix-status 2 :recklessly-p t))))
 (setf *server* (start (make-instance 'easy-acceptor :port *port* :address "127.0.0.1")))
 (format t "~&[console] ready: http://127.0.0.1:~a/  sessions: ~a~%" *port* (length (session-ids)))
 (finish-output)
@@ -153,5 +182,10 @@
     ;; mode raised "The function SB-EXIT is undefined" instead of quitting.
     (progn (format t "SELFCHECK_OK_TO_QUIT~%")
            (finish-output)
-           (ignore-errors (sb-ext:quit :unix-status 0)))
+           ;; :RECKLESSLY-P — without it SBCL waits up to SB-EXT:*EXIT-TIMEOUT*
+           ;; (60 s) for the hunchentoot acceptor/worker threads, which never
+           ;; join, so this mode kept port 8977 bound for a full minute after
+           ;; announcing it was done.
+           (ignore-errors (hunchentoot:stop *server*))
+           (ignore-errors (sb-ext:quit :unix-status 0 :recklessly-p t)))
     (loop (sleep 60)))

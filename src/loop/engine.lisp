@@ -13,12 +13,28 @@
 ;;; ---------------------------------------------------------------------------
 
 (defclass memory ()
-  ((entries :initarg :entries :initform nil :accessor memory-entries)))
+  ((entries :initarg :entries :initform nil :accessor memory-entries)
+   ;; Tail CONS of ENTRIES. The engine now mirrors every message into the memory
+   ;; store (see REMEMBER), so the previous (setf entries (append entries ...))
+   ;; made every single message copy the whole transcript — O(n^2) over a long
+   ;; conversation, on top of the transcript append the engine already does.
+   (tail    :initform nil :accessor memory-tail)))
+
+(defun memory-set-entries (memory entries)
+  "Install ENTRIES as the store's contents, fixing up the tail pointer."
+  (setf (memory-entries memory) entries
+        (memory-tail memory) (last entries))
+  entries)
 
 (defun memory-add (memory msg)
-  (setf (memory-entries memory)
-        (append (memory-entries memory) (list msg)))
-  msg)
+  "Append MSG in O(1)."
+  (let ((cell (list msg)))
+    (if (memory-tail memory)
+        (progn (setf (cdr (memory-tail memory)) cell)
+               (setf (memory-tail memory) cell))
+        (setf (memory-entries memory) cell
+              (memory-tail memory) cell))
+    msg))
 
 (defun memory-window (memory &optional (n nil))
   "Last N entries (nil = all)."
@@ -348,7 +364,10 @@
 ;; ---------------------------------------------------------------------------
 
 (defvar *tool-guards* nil
-  "Alist (TOOL-NAME . (FN . PLIST)) of rules consulted BEFORE a tool executes.
+  "Alist (TOOL-NAME . RULES) where RULES is a list of (FN . PLIST); every rule is
+  consulted before the tool executes. Each tool holds a LIST: keeping one entry per
+  tool meant a second audit rule for the same tool silently REPLACED the first, so
+  the earlier rule stopped being preventive (reproduced).
   TOOL-NAME is a registry name, or the wildcard \"any\"/\"*\" for every tool.
   This is the preventive half of the audit layer: a global guard is only
   consulted at the top of a step, i.e. after the offending tool has already
@@ -361,15 +380,15 @@
   "Register FN as a pre-execution rule for TOOL-NAME. FN is called as
   (FN AGENT TOOL-NAME ARGS-PLIST) and returns a reason string or NIL.
   ON-VIOLATION is :block (refuse the call) or :warn/:report (run it, but
-  annotate the result). Returns the normalized tool name."
+  annotate the result). Rules ACCUMULATE per tool. Returns the normalized name."
   (let* ((key (if (tool-guard-wildcard-p tool-name)
                   "any"
                   (string-downcase (string tool-name))))
-         (entry (assoc key *tool-guards* :test #'string=)))
+         (entry (assoc key *tool-guards* :test #'string=))
+         (rule (list* fn (list :on-violation on-violation :name name))))
     (if entry
-        (setf (cdr entry) (list fn :on-violation on-violation :name name))
-        (push (cons key (list fn :on-violation on-violation :name name))
-              *tool-guards*))
+        (setf (cdr entry) (append (cdr entry) (list rule)))
+        (push (cons key (list rule)) *tool-guards*))
     key))
 
 (defun unregister-tool-guard (tool-name)
@@ -383,21 +402,41 @@
 (defun clear-tool-guards ()
   (setf *tool-guards* nil))
 
+(defun canonical-tool-name (tool-name)
+  "Registry (DSL) name for a tool name as it arrives ON THE WIRE.
+
+  The model is only ever told the WIRE name (tool-schema publishes time_now for
+  the DSL tool time.now), so every name that comes back from a provider — and
+  therefore every name this layer sees — is mangled. Comparing those raw names
+  against rules registered under DSL names silently missed EVERY tool-scoped
+  audit rule whose name contained a character the wire format replaces, i.e. all
+  of them: reproduced end-to-end, a rule declared as (:applies-to probe.effect)
+  did not fire for the model's own call to probe_effect and the tool ran."
+  (let ((tool (ignore-errors (agent-cl.tools:find-tool tool-name))))
+    (if tool (agent-cl.tools:tool-name tool) tool-name)))
+
 (defun tool-guard-rules-for (tool-name)
-  "Every rule that applies to TOOL-NAME: exact matches first, then wildcards."
-  (let ((key (string-downcase (string tool-name))))
-    (append (remove-if-not (lambda (e) (string= (car e) key)) *tool-guards*)
-            (remove-if-not (lambda (e) (string= (car e) "any")) *tool-guards*))))
+  "Every RULE (FN . PLIST) that applies to TOOL-NAME: exact matches first, then
+  wildcards. TOOL-NAME may be a wire name or a DSL name; a rule matches either
+  spelling, so rules keep working whichever form the caller has to hand."
+  (let* ((key (string-downcase (string tool-name)))
+         (canon (string-downcase (string (canonical-tool-name tool-name)))))
+    (append (loop for e in *tool-guards*
+                  when (or (string= (car e) key) (string= (car e) canon))
+                    append (cdr e))
+            (loop for e in *tool-guards*
+                  when (string= (car e) "any")
+                    append (cdr e)))))
 
 (defun tool-guard-decision (agent tool-name args)
   "Consult the pre-execution rules for TOOL-NAME.
   Returns (values ACTION REASON RULE-NAME) where ACTION is :allow, :warn or
   :block. A rule that raises blocks (fail closed)."
   (let ((worst :allow) (worst-reason nil) (worst-name nil))
-    (dolist (entry (tool-guard-rules-for tool-name))
-      (let* ((fn (second entry))
-             (opts (cddr entry))
-             (rule-name (or (getf opts :name) (car entry)))
+    (dolist (rule (tool-guard-rules-for tool-name))
+      (let* ((fn (car rule))
+             (opts (cdr rule))
+             (rule-name (or (getf opts :name) "tool-guard"))
              (reason (handler-case (funcall fn agent tool-name args)
                        (error (e)
                          (format nil "规则抛错（按阻断处理）: ~a" e)))))
@@ -456,37 +495,44 @@
   after that point would REPLAY text the user has already seen, so it is not
   allowed — the failure is surfaced instead of silently duplicating output.")
 
+(defvar *partial-stream-usage* nil
+  "Usage reported by the streaming attempt currently in flight. Set by
+  DRAIN-STREAM-TURN even when the attempt then fails, so RUN can still charge it.")
+
 (defun drain-stream-turn (agent params on-token)
   "Run a streaming request and accumulate the turn, calling ON-TOKEN with text
   deltas as they arrive."
   (let ((turn (agent-cl.llm:perform-request (agent-transport agent) params)))
     (typecase turn
       (agent-cl.llm:turn-result turn)
-      (t (let ((prev 0))
-           (loop while (not (agent-cl.llm:stream-finished-p turn))
-                 for status = (agent-cl.llm:stream-advance turn)
-                 until (eq status :eof)
-                 do (when on-token
-                      (let ((text (agent-cl.llm:stream-text turn)))
-                        (when (> (length text) prev)
-                          (setf *turn-tokens-emitted* t)
-                          (funcall on-token (subseq text prev))
-                          (setf prev (length text))))))
-           ;; A stream that ends without [DONE] AND without a finish_reason was
-           ;; cut short (network drop / provider error). Note that a provider may
-           ;; legally omit [DONE] while still sending finish_reason (some
-           ;; compatible endpoints do), which is why BOTH must be missing.
-           (when (and (not (agent-cl.llm:stream-done-seen turn))
-                      (null (agent-cl.llm:stream-finish turn)))
-             ;; EOF with no tool calls, no finish and no text is an empty turn,
-             ;; not a dropped connection: report it as retryable either way, but
-             ;; keep the distinction in the message.
-             (error 'agent-cl.core:transport-error
-                    :message (if (plusp (length (agent-cl.llm:stream-text turn)))
-                                 "stream ended before [DONE] (connection dropped?)"
-                                 "stream ended without [DONE] or finish_reason")
-                    :retryable t))
-           (agent-cl.llm:stream-finalize turn))))))
+      (t (unwind-protect
+              (let ((prev 0))
+                (loop while (not (agent-cl.llm:stream-finished-p turn))
+                      for status = (agent-cl.llm:stream-advance turn)
+                      until (eq status :eof)
+                      do (when on-token
+                           (let ((text (agent-cl.llm:stream-text turn)))
+                             (when (> (length text) prev)
+                               (setf *turn-tokens-emitted* t)
+                               (funcall on-token (subseq text prev))
+                               (setf prev (length text))))))
+                ;; A stream that ends without [DONE] AND without a finish_reason
+                ;; was cut short (network drop / provider error). Note that a
+                ;; provider may legally omit [DONE] while still sending
+                ;; finish_reason, which is why BOTH must be missing.
+                (when (and (not (agent-cl.llm:stream-done-seen turn))
+                           (null (agent-cl.llm:stream-finish turn)))
+                  (error 'agent-cl.core:transport-error
+                         :message (if (plusp (length (agent-cl.llm:stream-text turn)))
+                                      "stream ended before [DONE] (connection dropped?)"
+                                      "stream ended without [DONE] or finish_reason")
+                         :retryable t))
+                (agent-cl.llm:stream-finalize turn))
+           ;; Whether or not the drain succeeded, keep the usage the provider
+           ;; already reported: a stream that dies AFTER the usage chunk was
+           ;; billed in full, and dropping it made failed turns invisible to the
+           ;; cost view and to the max-tokens guard.
+           (setf *partial-stream-usage* (agent-cl.llm:stream-usage turn)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; public API
@@ -512,7 +558,11 @@
   dispatch loop is unwound by an interrupt (or any condition), the transcript is
   left with a tool_calls message that has fewer results than calls. That is an
   illegal message sequence for OpenAI/DeepSeek, so the NEXT request fails with
-  400 and the session is permanently broken — not just this turn."
+  400 and the session is permanently broken — not just this turn.
+
+  Counts are compared per ID, not by membership: a provider that repeats an id
+  (or two turns whose synthesized ids collide) used to make one result satisfy
+  two calls, which is exactly the broken sequence this function exists to fix."
   (let* ((msgs (agent-messages agent))
          (assistant (find-if (lambda (m) (eq (agent-cl.messages:msg-role m) :assistant))
                              (reverse msgs)))
@@ -523,11 +573,19 @@
           (cond ((eq m assistant) (return))
                 ((eq (agent-cl.messages:msg-role m) :tool)
                  (push (agent-cl.messages:msg-tool-call-id m) answered))))
-        (dolist (tc calls)
-          (unless (member (agent-cl.messages:tool-call-id tc) answered :test #'equal)
-            (remember agent
-                      (agent-cl.messages:tool-result-message
-                       (agent-cl.messages:tool-call-id tc) note)))))
+        ;; how many results each id already has vs how many calls want it
+        (let ((remaining (make-hash-table :test 'equal)))
+          (dolist (tc calls)
+            (incf (gethash (agent-cl.messages:tool-call-id tc) remaining 0)))
+          (dolist (id answered)
+            (when (plusp (gethash id remaining 0))
+              (decf (gethash id remaining))))
+          (dolist (tc calls)
+            (let ((id (agent-cl.messages:tool-call-id tc)))
+              (when (plusp (gethash id remaining 0))
+                (decf (gethash id remaining))
+                (remember agent
+                          (agent-cl.messages:tool-result-message id note)))))))
       t)))
 
 (defun execute-tool-round (agent result policy)
@@ -538,11 +596,16 @@
   skips get an explicit note, and if dispatch is unwound by an interrupt the
   remaining calls get placeholders. Without that, the transcript holds a
   tool_calls message with fewer results than calls — an illegal sequence for
-  OpenAI/DeepSeek, so every LATER request in the session fails with 400."
+  OpenAI/DeepSeek, so every LATER request in the session fails with 400.
+
+  A stop() is honoured BETWEEN calls: Ctrl-C used to cancel only the step loop,
+  so the remaining calls of a multi-call round still ran — including destructive
+  ones — even though the user had just interrupted."
   (let* ((tcs (agent-cl.llm:result-tool-calls result))
          (parallel (policy-parallel-tools policy))
          (to-run (if parallel tcs (subseq tcs 0 (min 1 (length tcs)))))
-         (skipped (if parallel nil (subseq tcs (min 1 (length tcs))))))
+         (skipped (if parallel nil (subseq tcs (min 1 (length tcs)))))
+         (executed 0))
     (remember agent
               (agent-cl.messages:assistant-message
                (or (agent-cl.llm:result-content result) "")
@@ -550,15 +613,22 @@
     (unwind-protect
          (progn
            (dolist (tc to-run)
-             (multiple-value-bind (content status)
-                 (dispatch-tool-call agent tc policy)
-               (on-tool-result agent
-                               (agent-cl.messages:tool-call-name tc)
-                               (list :content content :status status))
-               (remember agent
-                         (agent-cl.messages:tool-result-message
-                          (agent-cl.messages:tool-call-id tc)
-                          content))))
+             (if (agent-stopped-p agent)
+                 ;; the remaining calls are answered by ENSURE-TOOL-RESULTS
+                 (return)
+                 (multiple-value-bind (content status)
+                     (dispatch-tool-call agent tc policy)
+                   (incf executed)
+                   ;; report the name the user knows (time.now), not the mangled
+                   ;; wire form the provider echoed back (time_now)
+                   (on-tool-result agent
+                                   (canonical-tool-name
+                                    (agent-cl.messages:tool-call-name tc))
+                                   (list :content content :status status))
+                   (remember agent
+                             (agent-cl.messages:tool-result-message
+                              (agent-cl.messages:tool-call-id tc)
+                              content)))))
            (dolist (tc skipped)
              (remember agent
                        (agent-cl.messages:tool-result-message
@@ -566,7 +636,7 @@
                         "[未执行：本 agent 为串行（parallel-tools=nil）模式，一次只运行第一个工具调用]"))))
       (ensure-tool-results
        agent "[中断：该工具调用未执行，结果占位以保持消息配对]"))
-    (length to-run)))
+    executed))
 
 (defun run (agent task &key (max-steps nil) (stream nil) (on-token nil))
   "Drive AGENT on TASK until the model answers, a guard fires, or the step
@@ -594,16 +664,35 @@
                     (outcome (progn (before-llm-call agent params)
                                     (call-model agent params stream on-token))))
                (cond
+                 ((eq (first outcome) :pause)
+                  ;; A pause is control flow: report it AS a pause so a caller
+                  ;; branching on STOP-REASON sees :paused whether the pause came
+                  ;; from the model call or from a tool.
+                  (setf guard-reason (second outcome)
+                        stop-reason :paused)
+                  (add-usage agent (third outcome))
+                  (setf final (make-turn-summary :done-p nil
+                                                 :guard-reason guard-reason
+                                                 :stop-reason stop-reason
+                                                 :steps step
+                                                 :truncated-p truncated
+                                                 :tool-count tool-count)))
                  ((eq (first outcome) :error)
                   ;; A failed model call is NOT a guard trip. GUARD-REASON still
                   ;; carries a readable string for display, but STOP-REASON says
                   ;; what really happened.
                   (setf guard-reason (second outcome)
                         stop-reason :model-error)
+                  ;; A stream that reported usage and THEN died was charged by the
+                  ;; provider, so it must still be counted here: otherwise the
+                  ;; cost view and the max-tokens guard are blind to exactly the
+                  ;; traffic that burns tokens.
+                  (add-usage agent (third outcome))
                   (setf final (make-turn-summary :done-p nil
                                                  :guard-reason guard-reason
                                                  :stop-reason stop-reason
                                                  :steps step
+                                                 :truncated-p truncated
                                                  :tool-count tool-count)))
                  (t
                   (let ((result (second outcome)))
@@ -613,15 +702,33 @@
                     (if (agent-cl.llm:result-tool-calls result)
                         (incf tool-count (execute-tool-round agent result policy))
                         (let ((content (or (agent-cl.llm:result-content result) "")))
-                          (remember agent
-                                    (agent-cl.messages:assistant-message content))
-                          (setf final (make-turn-summary
-                                       :done-p t
-                                       :final-content content
-                                       :steps step
-                                       :tool-count tool-count
-                                       :truncated-p truncated
-                                       :usage (agent-cl.llm:result-usage result))))))))))
+                          (if (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                                          content)))
+                              ;; An empty answer with no tool calls is NOT a
+                              ;; completed turn: presenting it as one gives the
+                              ;; caller a "successful" empty result it cannot
+                              ;; distinguish from a real answer (codec already
+                              ;; treats the sibling anomalies this way).
+                              (progn
+                                (setf guard-reason "模型返回了空回答（既无内容也无工具调用）"
+                                      stop-reason :empty-answer)
+                                (setf final (make-turn-summary
+                                             :done-p nil
+                                             :guard-reason guard-reason
+                                             :stop-reason stop-reason
+                                             :steps step
+                                             :truncated-p truncated
+                                             :tool-count tool-count)))
+                              (progn
+                                (remember agent
+                                          (agent-cl.messages:assistant-message content))
+                                (setf final (make-turn-summary
+                                             :done-p t
+                                             :final-content content
+                                             :steps step
+                                             :tool-count tool-count
+                                             :truncated-p truncated
+                                             :usage (agent-cl.llm:result-usage result))))))))))))
     (let ((summary (or final
                        (make-turn-summary
                         :done-p nil
@@ -648,26 +755,41 @@
                      (round (* seconds internal-time-units-per-second)))))
     (loop while (< (get-internal-real-time) deadline)
           do (when (agent-stopped-p agent) (return nil))
-             (sleep (min 0.1 (/ (- deadline (get-internal-real-time))
-                                internal-time-units-per-second))))
+             ;; MAX: the remaining time can be non-positive by the time this is
+             ;; computed (the clock moved between the test and here), and SLEEP
+             ;; signals a type error on a negative argument.
+             (sleep (max 0.01
+                        (min 0.1 (/ (- deadline (get-internal-real-time))
+                                    internal-time-units-per-second)))))
     (not (agent-stopped-p agent))))
 
 (defun call-model (agent params stream on-token)
   "One LLM round trip with automatic retry of transient transport failures
   (5xx/429, i.e. transport-error with RETRYABLE-P). Retry count is bounded by
   AGENT-CL.LLM:*MAX-RETRIES* and gated by the policy's ALLOW-MODEL-RETRY flag.
-  Returns (:ok turn-result) or (:error readable-reason).
+  Returns one of:
+    (:ok TURN-RESULT)
+    (:pause READABLE-REASON)          ; a pause is control flow, not a failure
+    (:error READABLE-REASON USAGE)    ; USAGE is the partial stream usage or NIL
 
   A streaming attempt that already emitted tokens is NEVER retried: the delta
   callback has no way to un-print what the user has seen, so a retry would show
-  the same text twice. Those failures are surfaced instead."
+  the same text twice. Those failures are surfaced instead.
+
+  Retry progress goes through the project logger, not FORMAT T: a stray line on
+  stdout corrupts the pinned footer of the full-screen REPL."
   (let* ((policy (agent-policy agent))
          (budget (if (policy-allow-model-retry policy)
                      (or agent-cl.llm:*max-retries* 0)
                      0))
          (attempt 0)
+         ;; usage reported by a FAILED attempt: the global is cleared at the start
+         ;; of every attempt, so without this a retry discarded what the provider
+         ;; had already billed for the stream that died
+         (attempt-usage nil)
          (*turn-tokens-emitted* nil))
     (loop
+      (setf *partial-stream-usage* nil)
       (handler-case
           (return
             (list :ok
@@ -675,31 +797,42 @@
                       (drain-stream-turn agent params on-token)
                       (agent-cl.llm:complete-turn (agent-transport agent) params))))
         (agent-cl.core:agent-pause (p)
-          (return (list :error
+          ;; :pause, not :error: the same condition raised by a tool propagates,
+          ;; and a caller branching on stop-reason must see :paused either way.
+          (return (list :pause
                         (format nil "paused: ~a"
-                                (agent-cl.core:agent-pause-reason p)))))
+                                (agent-cl.core:agent-pause-reason p))
+                        *partial-stream-usage*)))
         (agent-cl.core:transport-error (e)
           (let ((msg (or (agent-cl.core:agent-error-message e)
                          (princ-to-string e)))
                 (retryable (agent-cl.core:transport-error-retryable-p e)))
+            (when *partial-stream-usage*
+              (setf attempt-usage *partial-stream-usage*))
             (cond
               ((agent-stopped-p agent)
-               (return (list :error "已停止（stop），不再重试")))
+               (return (list :error "已停止（stop），不再重试"
+                             (or *partial-stream-usage* attempt-usage))))
               ((and retryable *turn-tokens-emitted*)
                (return (list :error
-                             (format nil "~a（已输出部分内容，不再重试以免重复显示）" msg))))
+                             (format nil "~a（已输出部分内容，不再重试以免重复显示）" msg)
+                             (or *partial-stream-usage* attempt-usage))))
               ((and retryable (< attempt budget))
                (incf attempt)
                (let ((backoff (min 8.0 (* 0.25 (expt 2 (1- attempt))))))
-                 (format t "~&[retry ~a/~a after ~,1fs] ~a~%" attempt budget backoff msg)
-                 (finish-output)
+                 (agent-cl.core:log-info "retry ~a/~a after ~,1fs: ~a"
+                                         attempt budget backoff msg)
                  (unless (sleep-interruptibly backoff agent)
-                   (return (list :error "重试等待期间被用户停止")))))
-              (t (return (list :error msg))))))
+                   (return (list :error "重试等待期间被用户停止"
+                                 (or *partial-stream-usage* attempt-usage))))))
+              (t (return (list :error msg
+                               (or *partial-stream-usage* attempt-usage)))))))
         (agent-cl.core:agent-error (e)
-          (return (list :error (agent-cl.core:agent-error-message e))))
+          (return (list :error (agent-cl.core:agent-error-message e)
+                        (or *partial-stream-usage* attempt-usage))))
         (error (e)
-          (return (list :error (format nil "unexpected: ~a" e))))))))
+          (return (list :error (format nil "unexpected: ~a" e)
+                        (or *partial-stream-usage* attempt-usage))))))))
 
 (defun ask (agent text &key (stream nil) (on-token nil))
   "Single user utterance convenience wrapper around RUN."

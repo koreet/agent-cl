@@ -470,8 +470,21 @@
       (ok (search "1024" (agent-cl.messages:msg-content (first tool-msgs)))))))
 
 (deftest code-exec-cleanup
+  "Unregistering a builtin tool must actually remove it, and re-registering must
+  restore it. This 'test' used to consist ONLY of five unregister-tool calls: no
+  assertions at all, so it passed forever while proving nothing (the harness now
+  rejects a test that makes no assertions)."
+  (register-builtin-tools)
+  (ok (agent-cl.tools:find-tool "code.exec") "the tool is registered to begin with")
   (dolist (n '("code.exec" "shell.run" "file.read" "file.write" "time.now"))
-    (unregister-tool n)))
+    (unregister-tool n))
+  (dolist (n '("code.exec" "shell.run" "file.read" "file.write" "time.now"))
+    (is-equal nil (agent-cl.tools:find-tool n)
+              (format nil "~a must be gone after unregister-tool" n)))
+  (register-builtin-tools)
+  (dolist (n '("code.exec" "shell.run" "file.read" "file.write" "time.now"))
+    (ok (agent-cl.tools:find-tool n)
+        (format nil "~a must come back after register-builtin-tools" n))))
 
 
 
