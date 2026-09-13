@@ -171,7 +171,12 @@
    ;; persistent identity (defidentity)
    #:defidentity
    #:identity-spec #:identity-traits #:identity-anchor #:identity-memory-policy
-   #:identity-trait #:identity-trait>= #:describe-identity))
+   #:identity-trait #:identity-trait>= #:describe-identity
+   ;; narrative memory (defmemory)
+   #:defmemory
+   #:memory-spec #:memory-content #:memory-salience #:memory-linked-to
+   #:memory-recall-when-form #:*default-decay-rate* #:decay-salience
+   #:memory-applicable-p #:recall-memories #:describe-memory))
 
 (defpackage #:agent-cl.session
   (:use #:cl)
@@ -185,10 +190,11 @@
 (defpackage #:agent-cl
   (:use #:cl)
   (:import-from #:agent-cl.dsl #:defagent #:defpolicy #:defguard #:defdsl-tool
-                #:defcommand #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple #:defidentity)
+                #:defcommand #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple #:defidentity #:defmemory)
   (:import-from #:agent-cl.loop #:make-agent #:run #:ask #:stop #:agent)
   (:export #:defagent #:defpolicy #:defguard #:defdsl-tool #:defcommand
            #:defdsl-package #:defschema #:defgoal #:defaudit #:defprinciple #:defidentity
+           #:defmemory
            #:make-agent #:run #:ask #:stop #:agent
            #:*default-model* #:*default-base-url*))
 
