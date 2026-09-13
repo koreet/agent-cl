@@ -15,7 +15,10 @@
            ;; cost guards: result cache + per-process search budget
            #:*web-search-budget* #:*web-search-calls* #:*search-cache-ttl*
            #:*search-fetcher* #:*web-search-tripped*
-           #:search-budget-left #:reset-web-search-budget #:clear-search-cache))
+           #:search-budget-left #:reset-web-search-budget #:clear-search-cache
+           ;; per-delegated-child allowance
+           #:*child-search-budget* #:child-budget-left
+           #:reset-child-search-budget #:child-agent-p))
 
 (in-package #:agent-cl.web)
 
@@ -314,6 +317,54 @@
   (when budget (setf *web-search-budget* budget))
   *web-search-budget*)
 
+;;; --- per-child-agent search budget -----------------------------------------
+;;; Delegated child agents keep web.search (it is genuinely useful for focused
+;;; research), but each child session gets its own hard cap so one runaway
+;;; child cannot drain the plan on its own. The parent is governed by the
+;;; process budget above; a child is governed by BOTH.
+
+(defparameter *child-search-budget* 3
+  "Max REAL searches a single delegated child agent may issue. NIL = no extra
+  per-child cap (the process budget still applies).")
+
+(defvar *child-search-usage* (make-hash-table :test 'eq)
+  "Child agent object -> real searches it has issued. Cleared by
+  reset-child-search-budget; entries keep their child object alive, which is
+  bounded by the number of children created in a session.")
+
+(defun agent-depth-safe (ctx)
+  "Depth of the agent in CTX (0 = top-level). Resolved at runtime because this
+  file is compiled before agent-cl.loop exists. A nil / non-agent CTX (direct
+  tool call in tests) counts as top-level."
+  (let* ((pkg (find-package "AGENT-CL.LOOP"))
+         (fn (and pkg (find-symbol "AGENT-DEPTH" pkg))))
+    (if fn
+        (or (ignore-errors (funcall fn ctx)) 0)
+        0)))
+
+(defun child-agent-p (ctx)
+  (and ctx (> (agent-depth-safe ctx) 0)))
+
+(defun child-searches-used (ctx)
+  (or (gethash ctx *child-search-usage*) 0))
+
+(defun note-child-search (ctx)
+  (when (child-agent-p ctx)
+    (setf (gethash ctx *child-search-usage*)
+          (1+ (child-searches-used ctx)))))
+
+(defun child-budget-left (ctx)
+  "Real searches this child may still issue (a large number when uncapped)."
+  (if (and (child-agent-p ctx) *child-search-budget*)
+      (max 0 (- *child-search-budget* (child-searches-used ctx)))
+      most-positive-fixnum))
+
+(defun reset-child-search-budget (&optional budget)
+  "Forget per-child usage (and optionally set a new per-child cap)."
+  (clrhash *child-search-usage*)
+  (when budget (setf *child-search-budget* budget))
+  *child-search-budget*)
+
 (defvar *web-search-tripped* nil
   "Set when the provider says the plan/quota is exhausted; further real
   searches are refused until the counter is reset.")
@@ -388,7 +439,6 @@
   cache, and at most *WEB-SEARCH-BUDGET* real requests are issued per process
   (cache hits are free); exceeding the budget returns an error rather than
   spending more quota."
-  (declare (ignore ctx))
   (let* ((query (getf args :QUERY))
          (max (or (getf args :MAX-RESULTS) 5))
          (backend (or (getf args :BACKEND) "tavily")))
@@ -405,7 +455,15 @@
         (return-from web-search
           (values "web.search 已熔断：上一次调用返回额度/限流错误（如 Tavily 432 usage limit）。请升级套餐或稍后 reset-web-search-budget，本进程不再发起检索。"
                   :error)))
-      ;; 2b) budget gate: refuse before spending any quota
+      ;; 2b) per-child gate: a delegated child has its own small allowance
+      (when (and (search-backend-ready-p backend)
+                 (child-agent-p ctx)
+                 (zerop (child-budget-left ctx)))
+        (return-from web-search
+          (values (format nil "web.search 子 agent 检索配额已用尽（每个子 agent 最多 ~a 次真实检索）。请基于已有信息作答，或由主 agent 补充检索。"
+                          *child-search-budget*)
+                  :error)))
+      ;; 2c) budget gate: refuse before spending any quota
       (when (and (search-backend-ready-p backend)
                  (zerop (search-budget-left)))
         (return-from web-search
@@ -416,6 +474,7 @@
       (handler-case
           (let ((results (if (search-backend-ready-p backend)
                              (progn (incf *web-search-calls*)
+                                    (note-child-search ctx)
                                     (call-search-backend backend query max))
                              (call-search-backend backend query max))))
             (if results

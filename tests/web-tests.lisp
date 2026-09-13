@@ -176,3 +176,67 @@
     ;; 3) resetting clears the breaker
     (agent-cl.web:reset-web-search-budget)
     (ok (not agent-cl.web:*web-search-tripped*) "reset clears the breaker")))
+
+;;; ---------------------------------------------------------------------------
+;;; per-delegated-child allowance
+;;;
+;;; Children keep web.search, but each child session has its own small cap so a
+;;; single runaway child cannot drain the plan; the parent is unaffected.
+;;; ---------------------------------------------------------------------------
+
+(defun stub-fetcher (counter)
+  "A fetch stub that increments COUNTER (a cons whose car is the tally)."
+  (lambda (backend query max)
+    (declare (ignore backend max))
+    (incf (car counter))
+    (list (list :TITLE "R" :URL "http://x/1" :CONTENT "snip"))))
+
+(deftest web-search-child-gets-its-own-smaller-cap
+  (let* ((tally (list 0))
+         (agent-cl.web:*search-fetcher* (stub-fetcher tally))
+         (agent-cl.web:*web-search-budget* nil)      ; process budget out of the way
+         (agent-cl.web:*search-cache-ttl* 3600)
+         (parent (make-agent :transport (make-mock-transport) :tools nil))
+         (child-agent (make-agent :transport (make-mock-transport) :tools nil
+                                  :depth 1)))
+    (agent-cl.web:reset-web-search-budget)
+    (agent-cl.web:reset-child-search-budget 2)   ; 2 real searches per child
+    (agent-cl.web:clear-search-cache)
+    ;; child: two distinct queries are allowed
+    (is-equal :ok (nth-value 1 (agent-cl.web:web-search
+                                (list :QUERY "c1") child-agent)))
+    (is-equal :ok (nth-value 1 (agent-cl.web:web-search
+                                (list :QUERY "c2") child-agent)))
+    (is-equal 2 (car tally))
+    (is-equal 0 (agent-cl.web:child-budget-left child-agent))
+    ;; child: third distinct query refused WITHOUT a request
+    (multiple-value-bind (c3 s3) (agent-cl.web:web-search
+                                  (list :QUERY "c3") child-agent)
+      (is-equal :error s3)
+      (ok (search "子 agent" c3) "explains the child allowance")
+      (is-equal 2 (car tally)) "no third request from the child")
+    ;; parent is NOT limited by the child cap
+    (is-equal :ok (nth-value 1 (agent-cl.web:web-search
+                                (list :QUERY "p1") parent)))
+    (is-equal 3 (car tally) "parent still searches")))
+
+(deftest web-search-top-level-context-is-not-a-child
+  ;; a nil ctx (direct tool call) and a depth-0 agent both count as top-level
+  (let* ((tally (list 0))
+         (agent-cl.web:*search-fetcher* (stub-fetcher tally))
+         (agent-cl.web:*web-search-budget* nil)
+         (agent-cl.web:*search-cache-ttl* 3600)
+         (parent (make-agent :transport (make-mock-transport) :tools nil)))
+    (agent-cl.web:reset-web-search-budget)
+    (agent-cl.web:reset-child-search-budget 1)
+    (agent-cl.web:clear-search-cache)
+    (ok (not (agent-cl.web:child-agent-p nil)) "nil ctx is top-level")
+    (ok (not (agent-cl.web:child-agent-p parent)) "depth 0 is top-level")
+    (ok (agent-cl.web:child-agent-p
+         (make-agent :transport (make-mock-transport) :tools nil :depth 1))
+        "depth 1 is a child")
+    ;; a top-level ctx is not capped by the (1-search) child allowance
+    (dotimes (i 3)
+      (is-equal :ok (nth-value 1 (agent-cl.web:web-search
+                                  (list :QUERY (format nil "top-~a" i)) parent))))
+    (is-equal 3 (car tally))))
