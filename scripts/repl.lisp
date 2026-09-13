@@ -76,21 +76,80 @@
 
 (defclass repl-agent (agent-cl.loop:agent) ())
 
+;;; --- sub-agent activity display -------------------------------------------
+;;; task.delegate hands a subtask to a child agent that shares this class and
+;;; runs one depth level deeper (see src/tools/builtin.lisp). Routing its steps
+;;; and tool calls through the pure agent-cl.render layout makes delegated work
+;;; visible and visually nested under the parent instead of silently swallowed.
+
+(defun repl-subagent-mark (depth)
+  "Display tag for activity from a delegated sub-agent at DEPTH (>= 1).
+   NIL at the top level, so a top-level agent's own output is never altered."
+  (when (plusp depth)
+    (format nil "[sub agent ~d]" depth)))
+
+(defun repl-activity (agent text &optional (base-indent 2))
+  "Render one activity line for AGENT through the pure nesting layout.
+   Depth 0 (the top-level agent) prepends only the usual gutter, so existing
+   output is byte-for-byte unchanged; a sub-agent is additionally indented and
+   tagged by repl-subagent-mark, so delegated work reads as nested."
+  (let ((depth (agent-cl.loop:agent-depth agent)))
+    (format nil "~a~a"
+            (make-string base-indent :initial-element #\Space)
+            (agent-cl.render:agent-activity-line
+             depth (repl-subagent-mark depth) text))))
+
+(defmethod agent-cl.loop:on-step-start ((a repl-agent) step-ctx)
+  "Show a sub-agent's steps. The top-level agent's steps stay implicit in the
+   streamed answer, so its output is unchanged."
+  (let ((depth (agent-cl.loop:agent-depth a)))
+    (when (plusp depth)
+      (format t "~&~a~%"
+              (repl-activity a (format nil "step ~a" (getf step-ctx :step))))
+      (finish-output))))
+
 (defmethod agent-cl.loop:on-tool-result ((a repl-agent) tool-name result-plist)
-  "REPL 里把工具执行可视化（流式进行中也会出现）。失败时打印具体原因，
-  否则用户只能看到 ERROR 而不知道工具为什么失败。"
-  (declare (ignore a))
+  "REPL printer: show every tool result. A sub-agent's call is indented and
+   [sub agent N]-tagged so delegated activity is distinct from the parent's; a
+   failure prints the concrete reason (truncated) so the user is not left
+   staring at a bare ERROR."
   (let ((status (getf result-plist :status))
         (content (getf result-plist :content)))
     (if (eq status :ok)
-        (format t "~&  [tool ~a -> OK]~%" tool-name)
+        (format t "~&~a~%" (repl-activity a (format nil "[tool ~a -> OK]" tool-name)))
         (progn
-          (format t "~&  [tool ~a -> ~a]~%" tool-name status)
-          ;; 失败详情对用户排查至关重要：截断显示，避免超长内容刷屏
+          (format t "~&~a~%"
+                  (repl-activity a (format nil "[tool ~a -> ~a]" tool-name status)))
           (when content
-            (format t "    ~a~%"
-                    (subseq content 0 (min 400 (length content))))))))
+            (format t "~a~%"
+                    (repl-activity a
+                                   (subseq content 0 (min 400 (length content)))
+                                   4))))))
   (finish-output))
+
+(defun repl-print-activity-block (agent text &optional (base-indent 2))
+  "Print multi-line TEXT as AGENT activity, one gutter line per input line.
+   The first line carries the sub-agent tag; continuations stay aligned.
+   Long output is truncated so a runaway conclusion cannot flood the REPL."
+  (let* ((cap 2000)
+         (shown (if (> (length text) cap)
+                    (concatenate 'string (subseq text 0 cap) " …")
+                    text))
+         (lines (uiop:split-string shown :separator (list #\Newline))))
+    (format t "~&~a~%" (repl-activity agent (first lines) base-indent))
+    (dolist (l (rest lines))
+      (format t "~&~a~%" (repl-activity agent l base-indent)))
+    (finish-output)))
+
+(defmethod agent-cl.loop:on-turn-done ((a repl-agent) summary)
+  "Show a sub-agent's conclusion the moment that (child) agent finishes.
+   The top-level agent's conclusion is already the streamed answer, so depth 0
+   stays silent and existing output is unchanged."
+  (let ((depth (agent-cl.loop:agent-depth a)))
+    (when (and (plusp depth) (agent-cl.loop:done-p summary))
+      (let ((text (agent-cl.loop:final-content summary)))
+        (when (and text (plusp (length text)))
+          (repl-print-activity-block a (format nil "结论: ~a" text)))))))
 
 (defparameter *repl-system-prompt*
   (concatenate 'string
@@ -601,6 +660,7 @@
   (format t "  /model [名称]  从 API 拉取模型列表并选择；带名称则直接切换~%")
   (format t "  /demo          markdown 渲染 + 状态栏自检~%")
   (format t "  /engine new|legacy  渲染引擎新/旧（旧=无代码围栏高亮）~%")
+  (format t "  /footer on|off 开/关底部常驻状态栏与输入栏~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
   (format t "  /quit 或 /exit 退出~%"))
 
@@ -695,6 +755,17 @@
          (t (format t "~&用法: /engine new|legacy；当前 ~a~%" *engine*)))
        (when (member rest '("new" "legacy") :test #'string=)
          (format t "~&渲染引擎: ~a~%" *engine*)))
+      ((string= cmd "/footer")
+       (cond
+         ((and rest (string= rest "off"))
+          (footer-disable)
+          (format t "~&[repl] 底部状态栏已关闭（/footer on 恢复）。~%"))
+         ((and rest (string= rest "on"))
+          (if (footer-enable)
+              (format t "~&[repl] 底部状态栏/输入栏已固定。~%")
+              (format t "~&[repl] 此终端无法固定底部（输出被重定向或无 VT 支持）。~%")))
+         (t (format t "~&底部状态栏: ~a（用法: /footer on|off）~%"
+                    (if (footer-active-p) "on" "off")))))
 
       ((or (string= cmd "/quit") (string= cmd "/exit"))
        (uiop:quit 0))
@@ -778,9 +849,10 @@
           (m (agent-cl.loop:agent-cache-miss agent)))
       (when (plusp (+ h m)) (/ h (float (+ h m)))))))
 
-(defun render-status-bar (agent)
-  "Print a one-line status bar: model | token split (auto-scaled) |
-  optional cache hit-rate | working dir. Shown with every prompt."
+(defun status-bar-text (agent)
+  "One-line status: model | token split (auto-scaled) | optional cache
+  hit-rate | working dir. Returned as a string rather than printed, so the
+  plain prompt path and the pinned bottom footer render identical content."
   (let* ((model (agent-cl.loop:agent-model agent))
          (pin   (agent-cl.loop:agent-usage-prompt agent))
          (pout  (agent-cl.loop:agent-usage-completion agent))
@@ -788,7 +860,7 @@
          (rate  (cache-hit-rate agent))
          (dir   (current-workdir))
          (tk #'agent-cl.core:format-token-count))
-    (format t "~&  ~a ~a | ~a ~a ~a~@[ ~a~] | ~a~%"
+    (format nil "  ~a ~a | ~a ~a ~a~@[ ~a~] | ~a"
             (ansi 90 "──")                          ; dim rule
             (ansi 36 (format nil "~a" model))
             (ansi 32 (format nil "^~a" (funcall tk pin)))   ; prompt (in)
@@ -797,6 +869,93 @@
             (when rate
               (ansi 35 (format nil "cache ~d%" (round (* rate 100)))))
             (ansi 90 dir))))
+
+(defun render-status-bar (agent)
+  "Print the status bar above the prompt. Fallback path, used when no console
+  footer can be pinned."
+  (format t "~&~a~%" (status-bar-text agent)))
+
+;;; ---------------------------------------------------------------------------
+;;; pinned bottom footer：状态栏 + 输入行常驻终端底部
+;;; ---------------------------------------------------------------------------
+;;; When the REPL owns a real console we reserve the bottom two rows as a footer
+;;; (status above, input below) and restrict scrolling to the rows above it, so
+;;; transcript output scrolls underneath a bar that never moves. Without a
+;;; console — output redirected, no VT support, or a screen too short — the
+;;; footer stays off and the previous "status bar, then prompt" flow is intact.
+
+(defparameter *repl-prompt* "CL-USER> ")
+
+(defvar *footer* nil
+  "Plist describing the pinned footer, or NIL when disabled:
+  :cols :rows :handle :scroll-top :scroll-bottom :status-row :input-row.")
+
+(defun footer-active-p () (and *footer* t))
+
+(defun footer-enable ()
+  "Pin the footer at the bottom. T on success; NIL (no side effects) when the
+  terminal cannot support it."
+  (let ((cap (agent-cl.render:probe-console)))
+    (when cap
+      (let* ((rows   (getf cap :rows))
+             (cols   (getf cap :cols))
+             (handle (getf cap :handle))
+             (layout (agent-cl.render:footer-layout rows))
+             (vt     (or (getf cap :vt)
+                         (and handle (agent-cl.render:console-enable-vt handle)))))
+        (when (and layout vt (integerp cols) (plusp cols))
+          (setf *footer* (append (list :cols cols :rows rows :handle handle)
+                                 layout))
+          (format t "~a" (agent-cl.render:set-scroll-region
+                          (getf *footer* :scroll-top)
+                          (getf *footer* :scroll-bottom)))
+          ;; park inside the scrolling region and emit a real newline, so the
+          ;; stream's column bookkeeping (fresh-line / ~&) agrees with the screen
+          (format t "~a" (agent-cl.render:cursor-to
+                          (getf *footer* :scroll-bottom) 1))
+          (terpri)
+          (finish-output)
+          t)))))
+
+(defun footer-disable ()
+  "Hand the terminal back: full-screen scrolling, cursor below the footer.
+  Safe to call when the footer was never enabled."
+  (when *footer*
+    (let ((f *footer*))
+      (setf *footer* nil)
+      (format t "~a" (agent-cl.render:reset-scroll-region))
+      (format t "~a" (agent-cl.render:cursor-to (getf f :rows) 1))
+      (terpri)
+      (finish-output))))
+
+(defun footer-draw-status (agent)
+  "Repaint the status row in place. The saved/restored cursor means this never
+  disturbs the position transcript output flows from."
+  (format t "~a~a~a~a~a"
+          (agent-cl.render:save-cursor)
+          (agent-cl.render:cursor-to (getf *footer* :status-row) 1)
+          (agent-cl.render:erase-line)
+          (agent-cl.render:pad-ansi-line (status-bar-text agent)
+                                         (getf *footer* :cols))
+          (agent-cl.render:restore-cursor)))
+
+(defun footer-draw-prompt ()
+  "Clear the input row and show the prompt on it."
+  (format t "~a~a~a"
+          (agent-cl.render:cursor-to (getf *footer* :input-row) 1)
+          (agent-cl.render:erase-line)
+          *repl-prompt*)
+  (finish-output))
+
+(defun footer-begin-output (&optional echo)
+  "Park the cursor at the bottom of the scrolling region before a turn prints.
+  ECHO re-prints an accepted input line there, because the transient input row
+  is erased at the next prompt and would otherwise vanish from the transcript."
+  (format t "~a" (agent-cl.render:cursor-to (getf *footer* :scroll-bottom) 1))
+  (if echo
+      (format t "~a~a~%" *repl-prompt* echo)
+      (terpri))
+  (finish-output))
 
 (defun ask-turn (agent line)
   (unwind-protect
@@ -827,26 +986,44 @@
 ;; 主循环
 ;; ---------------------------------------------------------------------------
 (handler-case
-    (let ((agent (make-repl-agent)))
-      (prune-empty-sessions)          ; 清掉"建了没写"的空会话目录
-      (repl-new-session agent)
-      (format t "~&Agent-CL REPL — 输入任务；/help 查看命令；/quit 退出；Ctrl-C 中断。~%")
-      (format t "流式输出 + Markdown 着色已启用（/color off 关闭）。~%")
-      (loop
-        ;; persistent status bar: shown with every prompt, not just after a turn
-        (render-status-bar agent)
-        (format t "~&CL-USER> ")
-        (finish-output)
-        (let ((line (read-line *standard-input* nil :eof)))
-          (cond
-            ;; EOF (stdin closed / piped input ended) -> exit
-            ((eq line :eof) (return))
-            ;; blank line = no-op (SLIME-style): just re-prompt, never exit
-            ((string= (string-trim '(#\Space #\Tab) line) "") nil)
-            ((char= (char line 0) #\/) (repl-command line agent))
-            (t (ask-turn agent line))))))
+    (unwind-protect
+         (let ((agent (make-repl-agent)))
+           (prune-empty-sessions)     ; 清掉“建了没写”的空会话目录
+           (repl-new-session agent)
+           (format t "~&Agent-CL REPL — 输入任务；/help 查看命令；/quit 退出；Ctrl-C 中断。~%")
+           (format t "流式输出 + Markdown 着色已启用（/color off 关闭）。~%")
+           ;; pin the status bar + input line to the bottom when the console can
+           ;; take it; otherwise the inline status bar above the prompt remains
+           (footer-enable)
+           (when (footer-active-p)
+             (format t "~&[repl] 状态栏与输入栏已固定在底部（/footer off 关闭）。~%"))
+           (loop
+             (if (footer-active-p)
+                 (progn (footer-draw-status agent) (footer-draw-prompt))
+                 (progn (render-status-bar agent)
+                        (format t "~&~a" *repl-prompt*)
+                        (finish-output)))
+             (let ((line (read-line *standard-input* nil :eof)))
+               (cond
+                 ;; EOF (stdin closed / piped input ended) -> exit
+                 ((eq line :eof)
+                  (when (footer-active-p) (footer-begin-output nil))
+                  (return))
+                 ;; blank line = no-op (SLIME-style): just re-prompt, never exit
+                 ((string= (string-trim '(#\Space #\Tab) line) "")
+                  (when (footer-active-p) (footer-begin-output nil)))
+                 (t
+                  ;; the transient input row is erased at the next prompt, so
+                  ;; copy the accepted line into the scrolling transcript
+                  (when (footer-active-p) (footer-begin-output line))
+                  (if (char= (char line 0) #\/)
+                      (repl-command line agent)
+                      (ask-turn agent line)))))))
+      ;; always hand the terminal back, including on Ctrl-C
+      (footer-disable))
   ;; Ctrl-C 优雅退出（--script 下无调试器）
   (sb-sys:interactive-interrupt ()
+    (footer-disable)
     (format t "~&[repl] 已退出（Ctrl-C）。~%")
     (finish-output)
     (uiop:quit 0)))
