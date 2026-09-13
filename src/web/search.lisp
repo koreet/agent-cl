@@ -1,10 +1,17 @@
-;;;; src/web/search.lisp — web.search: 免 key 的网页检索（DuckDuckGo Lite）。
+;;;; src/web/search.lisp — web.search: 网页检索。
 ;;;;
-;;;; 需要运行环境能发起 HTTPS GET（正常机器: ql 装 dexador；本仓库在 repl/smoke
-;;;; 里由 dev-http 提供）。无 dexador 时工具返回明确错误而非崩溃。
+;;;; Backend: Tavily (https://api.tavily.com/search) via a single HTTPS POST.
+;;;; It returns clean JSON ({query, results:[{title,url,content,score}]}), which
+;;;; avoids the HTML-scraping fragility of the old DuckDuckGo path — that path
+;;;; is kept below as :ddg for environments without a key, and is *opt-in*.
+;;;;
+;;;; The API key is never hard-coded: it is read from the tool argument, then
+;;;; TAVILY_API_KEY, then ~/.agent-cl/tavily-key.txt (outside the repo, like the
+;;;; model key). Without a key the tool returns a clear error, not a crash.
 (defpackage #:agent-cl.web
   (:use #:cl)
-  (:export #:web-search #:ddg-fetch-results))
+  (:export #:web-search #:ddg-fetch-results #:tavily-fetch-results
+           #:*tavily-key-file* #:tavily-key))
 
 (in-package #:agent-cl.web)
 
@@ -27,8 +34,8 @@
   (format nil "https://html.duckduckgo.com/html/?q=~a" (pct-encode query)))
 
 (defun html-entity-decode (s)
-  "Decode common HTML entities: &lt; &gt; &amp; &quot; &#39; &nbsp; and
-  decimal numeric entities (&#NN;). Unknown entities are left as-is."
+  "Decode the HTML entities that show up in scraped text (lt, gt, amp,
+  quot, apos, nbsp) plus decimal numeric entities, then trim."
   (let ((out (make-string-output-stream)))
     (loop with i = 0 and n = (length s)
           while (< i n)
@@ -125,22 +132,157 @@
           (error "web http ~a" status))
         body))))
 
+(defun dexador-error-detail (condition)
+  "When CONDITION is dexador's http-request-failed, return (values status body);
+  otherwise NIL. Symbols are resolved at runtime so this file never has a
+  compile-time dependency on dexador being loaded."
+  (let* ((pkg (find-package "DEXADOR.ERROR"))
+         (cls (and pkg (find-symbol "HTTP-REQUEST-FAILED" pkg))))
+    (when (and cls (typep condition cls))
+      (let ((rs (find-symbol "RESPONSE-STATUS" pkg))
+            (rb (find-symbol "RESPONSE-BODY" pkg)))
+        (values (and rs (ignore-errors (funcall rs condition)))
+                (and rb (ignore-errors (funcall rb condition))))))))
+
+(defun http-post-json (url json headers)
+  "POST JSON to URL via dexador (resolved at runtime, same style as HTTP-GET).
+  Returns the FULL response body; a non-2xx status is turned into an error
+  carrying the provider's own message, so the agent can act on it."
+  (let ((pkg (find-package :dexador)))
+    (unless pkg
+      (error "web.search 需要 dexador（请先安装并加载，或在本仓库 repl/smoke 中运行）"))
+    (let ((post (find-symbol "POST" pkg)))
+      (unless post (error "dexador:POST 不可用"))
+      (let ((body nil) (status nil))
+        (handler-bind
+            ((error (lambda (condition)
+                      (multiple-value-bind (st detail) (dexador-error-detail condition)
+                        (when st
+                          (error "web http ~a: ~a" st (body-text detail)))))))
+          (setf (values body status)
+                (funcall post url :content json :headers headers
+                         :force-string t :read-timeout 60 :connect-timeout 30)))
+        (unless (and status (<= 200 status 299))
+          (error "web http ~a: ~a" status (body-text body)))
+        ;; the whole body: the caller parses it as JSON, so truncating here would
+        ;; hand yason half an object and it would die with END-OF-FILE
+        (body-text body nil)))))
+
+(defun body-text (body &optional limit)
+  "Best-effort printable text from a dexador body, which may be a string, a
+  byte vector, a decoding stream, or NIL. LIMIT NIL means the whole thing:
+  use that whenever the result is going to be parsed rather than shown."
+  (flet ((cut (s) (if limit (subseq s 0 (min limit (length s))) s)))
+    (handler-case
+        (cond
+          ((null body) "")
+          ((stringp body) (cut body))
+          ((streamp body)
+           (let ((out (make-string-output-stream)))
+             (loop repeat (or limit most-positive-fixnum)
+                   for ch = (read-char body nil nil)
+                   while ch
+                   do (write-char ch out))
+             (get-output-stream-string out)))
+          ((and (vectorp body) (not (stringp body)))
+           (cut (map 'string (lambda (b) (code-char (logand b 255))) body)))
+          (t (cut (princ-to-string body))))
+      (error () "<unreadable http body>"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Tavily (default backend)
+;;; ---------------------------------------------------------------------------
+
+(defparameter *tavily-key-file*
+  (merge-pathnames ".agent-cl/tavily-key.txt"
+                   (uiop:ensure-directory-pathname
+                    (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME") "/")))
+  "Fallback key location, deliberately outside the repo so it is never
+  committed. Created by hand; see tavily-key.")
+
+(defun read-key-file (path)
+  "Trimmed first line of PATH, or NIL when the file is absent/empty."
+  (when (and path (probe-file path))
+    (let ((line (string-trim '(#\Space #\Tab #\Newline #\Return)
+                             (with-open-file (s path :external-format :utf-8)
+                               (or (read-line s nil "") "")))))
+      (when (plusp (length line)) line))))
+
+(defun tavily-key (&optional explicit)
+  "Resolve the Tavily key: EXPLICIT argument, then TAVILY_API_KEY, then the key
+  file. NIL when none is configured (the caller then reports how to set one)."
+  (or (and explicit (plusp (length explicit)) explicit)
+      (let ((env (uiop:getenv "TAVILY_API_KEY")))
+        (and env (plusp (length env)) env))
+      (read-key-file *tavily-key-file*)))
+
+(defun tavily-request-json (key query max)
+  "Tavily /search request body. Built as a hash-table so json-encode emits a
+  proper JSON object (NIL would otherwise encode as null, not false)."
+  (let ((ht (make-hash-table :test 'equal)))
+    (setf (gethash "api_key" ht) key
+          (gethash "query" ht) query
+          (gethash "max_results" ht) max
+          (gethash "search_depth" ht) "basic"
+          (gethash "include_answer" ht) yason:false)
+    (agent-cl.core:json-encode ht)))
+
+(defun format-results (results)
+  "Render decoded Tavily results (a list of plists) as the agent-facing text:
+  one title-and-url line per result, with the snippet indented beneath when
+  present."
+  (format nil "~{~a~^~%~}"
+          (loop for r in results
+                for title = (or (getf r :TITLE) "(无标题)")
+                for url = (or (getf r :URL) "")
+                for content = (getf r :CONTENT)
+                collect (with-output-to-string (o)
+                          (format o "~a - ~a" title url)
+                          (when (and content (plusp (length content)))
+                            (format o "~%    ~a"
+                                    (subseq content 0 (min 300 (length content)))))))))
+
+(defun tavily-fetch-results (query max)
+  "Query Tavily and return a list of plists (:TITLE :URL :CONTENT :SCORE).
+  Signals a descriptive error when no key is configured or the call fails."
+  (let ((key (tavily-key)))
+    (unless key
+      (error "web.search 需要 Tavily API key：设置环境变量 TAVILY_API_KEY，或把 key 写入 ~a"
+             *tavily-key-file*))
+    (let* ((json (http-post-json "https://api.tavily.com/search"
+                                 (tavily-request-json key query max)
+                                 '(("Content-Type" . "application/json"))))
+           (decoded (agent-cl.core:json-decode json)))
+      (or (getf (agent-cl.core:object-to-plist decoded) :RESULTS)
+          '()))))
+
 (defun ddg-fetch-results (query max)
   (parse-links (http-get (ddg-url query max)) max))
 
 (defun web-search (args ctx)
-  "按 query 检索网页，返回至多 max_results 条「标题 - URL」。"
+  "按 query 检索网页，返回至多 max_results 条「标题 - URL」(+ 摘要行)。
+
+  Backend is Tavily (JSON, needs a key). Pass :backend \"ddg\" to use the
+  keyless DuckDuckGo HTML scraper instead."
   (declare (ignore ctx))
   (let* ((query (getf args :QUERY))
-         (max (or (getf args :MAX-RESULTS) 5)))
+         (max (or (getf args :MAX-RESULTS) 5))
+         (backend (or (getf args :BACKEND) "tavily")))
     (unless query
       (return-from web-search (values "missing :query" :error)))
     (handler-case
-        (let ((links (ddg-fetch-results query max)))
-          (if links
-              (values (format nil "~{~a - ~a~%~}"
-                              (loop for (t1 . u) in links
-                                    append (list t1 u)))
-                      :ok)
-              (values "没有找到相关结果" :error)))
+        (cond
+          ((string-equal backend "ddg")
+           (let ((links (ddg-fetch-results query max)))
+             (if links
+                 (values (format nil "~{~a - ~a~%~}"
+                                 (loop for (t1 . u) in links
+                                       append (list t1 u)))
+                         :ok)
+                 (values "没有找到相关结果" :error))))
+          (t
+           (let ((results (tavily-fetch-results query max)))
+             (if results
+                 (values (format-results results) :ok)
+                 (values "没有找到相关结果" :error)))))
       (error (e) (values (format nil "检索失败: ~a" e) :error)))))

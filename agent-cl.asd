@@ -77,6 +77,7 @@
    (:file "dsl-tests")
    (:file "session-tests")
    (:file "render-tests")
+   (:file "web-tests")
    (:file "terminal-tests")
    (:file "dsl-contract-tests")
    (:file "dsl-audit-tests")

@@ -382,10 +382,11 @@
                        :parameters (make-builtin-params
                                     ("key" :string :description "memory key" :required t)))
             (make-tool "web.search" #'agent-cl.web:web-search
-                       :description "Search the web (DuckDuckGo, no key). Query terms; returns top result titles + URLs for the agent to read/fetch."
+                       :description "Search the web. Query terms; returns top result titles + URLs (+ snippets) for the agent to read/fetch. Backend: Tavily (needs TAVILY_API_KEY); pass backend=\"ddg\" for the keyless DuckDuckGo fallback."
                        :parameters (make-builtin-params
                                     ("query" :string :description "search keywords" :required t)
-                                    ("max_results" :number :description "max results (default 5)")))
+                                    ("max_results" :number :description "max results (default 5)")
+                                    ("backend" :string :description "\"tavily\" (default) or \"ddg\" (keyless)")))
 )))
 
     (dolist (t1 tools)
