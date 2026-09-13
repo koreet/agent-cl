@@ -62,8 +62,13 @@
 
 (defun strip-ansi (s)
   "Remove ANSI/VT escape sequences from S so its *display* width can be measured.
-  Handles CSI (ESC [ ... final-byte) and two-character escapes (e.g. ESC 7).
-  Pure; SBCL's own printer never needs this, only width accounting does."
+  Handles CSI (ESC [ params... final), OSC (ESC ] ... BEL | ESC \\), the string
+  sequences DCS/PM/APC/SOS, and two-character escapes (e.g. ESC 7).
+
+  OSC and friends matter for width accounting, not just tidiness: their payload
+  (a window title, a hyperlink target) is not printed text, so counting it made
+  the footer status line too wide — and pad-ansi-line could then cut the sequence
+  in half, which corrupts the terminal. Pure."
   (with-output-to-string (o)
     (loop with i = 0 with n = (length s)
           while (< i n)
@@ -72,17 +77,43 @@
                ((char= ch #\Escape)
                 (incf i)
                 (when (< i n)
-                  (if (char= (char s i) #\[)
-                      (progn
-                        (incf i)
-                        ;; parameter bytes, then one final byte ending the CSI
-                        (loop while (and (< i n)
-                                         (let ((c (char s i)))
-                                           (or (digit-char-p c)
-                                               (member c '(#\; #\? #\> #\= #\Space)))))
-                              do (incf i))
-                        (when (< i n) (incf i)))
-                      (incf i))))          ; two-char escape: skip the second byte
+                  (let ((c (char s i)))
+                    (cond
+                      ;; CSI: ESC [ parameters/intermediates, then one final byte
+                      ((char= c #\[)
+                       (incf i)
+                       (loop while (and (< i n)
+                                        (let ((cc (char s i)))
+                                          (or (digit-char-p cc)
+                                              (member cc '(#\; #\? #\> #\= #\Space
+                                                           #\: #\! #\" #\$ #\' #\*
+                                                           #\+ #\, #\- #\. #\/)))))
+                             do (incf i))
+                       (when (< i n) (incf i)))
+                      ;; OSC: ESC ] ... terminated by BEL or ST (ESC \)
+                      ((char= c #\])
+                       (incf i)
+                       (loop while (and (< i n)
+                                        (not (char= (char s i) #\Bel))
+                                        (not (and (char= (char s i) #\Escape)
+                                                  (< (1+ i) n)
+                                                  (char= (char s (1+ i)) #\\))))
+                             do (incf i))
+                       (cond ((>= i n) nil)
+                             ((char= (char s i) #\Bel) (incf i))
+                             ((and (char= (char s i) #\Escape) (< (1+ i) n))
+                              (incf i 2))))
+                      ;; DCS / PM / APC / SOS: ESC P|^|_|X ... ST
+                      ((member c '(#\P #\^ #\_ #\X))
+                       (incf i)
+                       (loop while (and (< i n)
+                                        (not (and (char= (char s i) #\Escape)
+                                                  (< (1+ i) n)
+                                                  (char= (char s (1+ i)) #\\))))
+                             do (incf i))
+                       (when (and (< i n) (char= (char s i) #\Escape))
+                         (incf i 2)))
+                      (t (incf i))))))       ; two-char escape: skip the second byte
                (t (write-char ch o) (incf i))))))
 
 (defun fit-to-width (s cols)

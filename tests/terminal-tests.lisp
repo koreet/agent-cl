@@ -40,6 +40,28 @@
   ;; a bare trailing ESC must not blow up
   (is-equal "" (agent-cl.render:strip-ansi (format nil "~c" #\Escape))))
 
+(deftest terminal-strip-ansi-string-sequences
+  "OSC/DCS payloads are not printed text. Counting them made the status line look
+  too wide and let pad-ansi-line cut a sequence in half (terminal corruption)."
+  (let ((esc #\Escape))
+    ;; OSC terminated by BEL
+    (is-equal "ab" (agent-cl.render:strip-ansi
+                    (format nil "a~c]0;window title~cb" esc (code-char 7))))
+    ;; OSC terminated by ST (ESC \)
+    (is-equal "ab" (agent-cl.render:strip-ansi
+                    (format nil "a~c]8;;http://x~c\\b" esc esc)))
+    ;; DCS ... ST
+    (is-equal "ab" (agent-cl.render:strip-ansi
+                    (format nil "a~cP1;2|payload~c\\b" esc esc)))
+    ;; an unterminated OSC must not hang or swallow the rest silently
+    (is-equal "a" (agent-cl.render:strip-ansi (format nil "a~c]0;never closed" esc)))
+    ;; CSI with intermediates still works
+    (is-equal "x" (agent-cl.render:strip-ansi (format nil "~c[?25lx" esc)))
+    ;; width of a string carrying an OSC equals its visible width
+    (is-equal 2 (agent-cl.render:string-display-width
+                 (agent-cl.render:strip-ansi
+                  (format nil "ab~c]0;title~c" esc (code-char 7)))))))
+
 ;;;; footer geometry ---------------------------------------------------
 (deftest terminal-footer-layout-reserves-bottom-two-rows
   (let ((l (agent-cl.render:footer-layout 24)))

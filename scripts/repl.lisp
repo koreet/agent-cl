@@ -76,6 +76,10 @@
 
 (defclass repl-agent (agent-cl.loop:agent) ())
 
+;; Defined further down with the rest of the streaming renderer; declared here so
+;; the display hooks below can call it without a forward-reference warning.
+(declaim (ftype (function () t) flush-token-prefix))
+
 ;;; --- sub-agent activity display -------------------------------------------
 ;;; task.delegate hands a subtask to a child agent that shares this class and
 ;;; runs one depth level deeper (see src/tools/builtin.lisp). Routing its steps
@@ -104,6 +108,7 @@
    streamed answer, so its output is unchanged."
   (let ((depth (agent-cl.loop:agent-depth a)))
     (when (plusp depth)
+      (flush-token-prefix)
       (format t "~&~a~%"
               (repl-activity a (format nil "step ~a" (getf step-ctx :step))))
       (finish-output))))
@@ -113,6 +118,8 @@
    [sub agent N]-tagged so delegated activity is distinct from the parent's; a
    failure prints the concrete reason (truncated) so the user is not left
    staring at a bare ERROR."
+  ;; flush first, so this row cannot appear above text the model already emitted
+  (flush-token-prefix)
   (let ((status (getf result-plist :status))
         (content (getf result-plist :content)))
     (if (eq status :ok)
@@ -206,7 +213,20 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Markdown → ANSI 行级渲染（控制台友好；NO_COLOR=1 关闭颜色）
 ;;; ---------------------------------------------------------------------------
-(defvar *color* (null (uiop:getenv "NO_COLOR")))
+(defun color-capable-p ()
+  "True when ANSI colour is worth emitting on *STANDARD-OUTPUT*.
+
+  Redirecting the REPL to a file, a pipe or a CI log used to fill it with escape
+  sequences, so colour is now gated on having a real console. On Windows the
+  console probe is the reliable test: SBCL reports INTERACTIVE-STREAM-P as true
+  even for a redirected fd-stream (verified with piped input). NO_COLOR=1 still
+  has the final say on every platform."
+  (and (null (uiop:getenv "NO_COLOR"))
+       (if (uiop:os-windows-p)
+           (and (agent-cl.render:probe-console) t)
+           (or (ignore-errors (interactive-stream-p *standard-output*)) t))))
+
+(defvar *color* (color-capable-p))
 (defun esc (n) (format nil "~c[~am" #\Escape n))
 (defun ansi (n text) (if *color* (format nil "~a~a~a" (esc n) text (esc 0)) text))
 
@@ -385,15 +405,21 @@
 (defun render-md-text (text)
   "整段渲染（非流式 fallback / /load 载入会话）。"
   (setf *fence* :fence-out)
+  (setf *table-buf* nil)
   (let ((start 0))
     (loop for nl = (position #\Newline text :start start)
           while nl
           do (progn
-               (when (< start nl)
-                 (advance-fence-with-line (subseq text start nl)))
+               ;; NB: an EMPTY line (start = nl) must still be rendered: the old
+               ;; guard (when (< start nl) ...) silently dropped every blank line,
+               ;; so paragraph breaks disappeared on the non-streaming path.
+               (advance-fence-with-line (subseq text start nl))
                (setf start (1+ nl)))
           finally (when (< start (length text))
                     (advance-fence-with-line (subseq text start))))
+    ;; A table that ends the text must still reach the screen: it lives in
+    ;; *TABLE-BUF* until something flushes it, and nothing did at EOF.
+    (flush-table)
     (setf *fence* :fence-out)))
 
 ;;;; --- streaming buffer (complete lines are flushed as they arrive) -----
@@ -424,6 +450,20 @@
                (setf s (subseq s (1+ nl))))
           finally (write-string s *tok-buf*))
     (finish-output)))
+
+(defun flush-token-prefix ()
+  "Render whatever the streaming buffer still holds (a partial line), keeping the
+  fence state.
+
+  Called before any out-of-band row (a tool result, a sub-agent step): those used
+  to print IMMEDIATELY while the model's pending partial line stayed buffered, so
+  the screen showed the tool row BEFORE the assistant text that preceded it."
+  (let ((rest (get-output-stream-string *tok-buf*)))
+    (when (plusp (length rest))
+      (advance-fence-with-line rest)
+      (terpri)
+      (finish-output))))
+
 ;; END REPL RENDER PATCH
 
 ;; ---------------------------------------------------------------------------
@@ -478,7 +518,16 @@
           (subseq ms 0 (1- n))
           ms))))
 
+(defvar *repl-session* nil
+  "当前 REPL 会话对象（agent-cl.session:session）。")
+(defvar *persisted-count* 0
+  "已写入当前会话的消息条数（增量持久用）。")
+
 (defun import-transcript (agent path)
+  "Load a JSONL transcript into AGENT and make the session log agree with it.
+  IMPORT-TRANSCRIPT used to leave *PERSISTED-COUNT* untouched, so the next
+  REPL-PERSIST-TURN appended the WHOLE loaded history into the session again —
+  duplicate events on every /load."
   (let (msgs)
     (with-open-file (i path :direction :input :external-format :utf-8)
       (loop for line = (read-line i nil nil)
@@ -488,29 +537,63 @@
               do (push (wire->message (agent-cl.core:decode-to-plist trimmed)) msgs)))
     (setf msgs (sanitize-loaded-messages (nreverse msgs)))
     (setf (agent-cl.loop:agent-messages agent) msgs)
-    (format t "~&已载入 ~a 条消息~%" (length msgs))))
+    ;; the imported history is now the agent's state, so record it as such:
+    ;; persist it into the CURRENT session and mark it as already written
+    (setf *persisted-count* 0)
+    (repl-persist-turn agent)
+    (format t "~&已载入 ~a 条消息（已写入当前会话 ~a）~%"
+            (length msgs) (agent-cl.session:session-id *repl-session*))))
+
+(defun clean-input-line (line)
+  "Normalize one line of user input: strip surrounding whitespace including CR.
+
+  \\r matters: `read-line` splits on #\\Newline only, so on Windows (CRLF input,
+  piped or pasted text) every line arrived with a trailing #\\Return. `/help\\r`
+  was an unknown command and a line containing only \\r counted as a real prompt
+  instead of the blank-line no-op."
+  (string-trim '(#\Space #\Tab #\Return #\Newline) (or line "")))
 
 (defun session-root ()
   "REPL 会话根目录：~/.agent-cl/sessions/（仓库外，随用户持久）。"
-  (let ((d (merge-pathnames ".agent-cl/sessions/"
-                            (uiop:ensure-directory-pathname
-                             (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME"))))))
+  (let* ((home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME")))
+         (base (if (and home (plusp (length home)))
+                   (uiop:ensure-directory-pathname home)
+                   ;; no HOME at all (a service context, a stripped environment):
+                   ;; falling back to the cwd keeps sessions working instead of
+                   ;; erroring out inside ENSURE-DIRECTORY-PATHNAME.
+                   (progn
+                     (format t "~&[session] 警告：未找到 USERPROFILE/HOME，会话写入当前目录 ~a~%"
+                             (uiop:getcwd))
+                     (uiop:getcwd))))
+         (d (merge-pathnames ".agent-cl/sessions/" base)))
     (ensure-directories-exist d)
     d))
 
-(defvar *repl-session* nil
-  "当前 REPL 会话对象（agent-cl.session:session）。")
-(defvar *persisted-count* 0
-  "已写入当前会话的消息条数（增量持久用）。")
+(defparameter *prune-min-age-seconds* 3600
+  "Only prune a session directory that has been empty for at least this long, so
+  a session another REPL instance is still starting up is never deleted.")
 
 (defun prune-empty-sessions ()
   "Delete session directories that contain no events.jsonl. These come from
   sessions that were created but never written to (e.g. a repl started and
-  exited without a real turn); they hold no user data, only clutter the list."
-  (let ((root (session-root)))
+  exited without a real turn); they hold no user data, only clutter the list.
+
+  Only directories older than *prune-min-age-seconds* are touched, and the
+  current session is never touched: a session mid-startup (another REPL instance,
+  or this one before its first checkpoint) is EMPTY for a moment, and pruning it
+  broke that instance's writes."
+  (let ((root (session-root))
+        (now (get-universal-time))
+        (current (and *repl-session* (agent-cl.session:session-id *repl-session*))))
     (dolist (sub (uiop:subdirectories root))
-      (unless (uiop:file-exists-p (merge-pathnames "events.jsonl" sub))
-        (ignore-errors (uiop:delete-directory-tree sub :validate t :if-does-not-exist :ignore))))))
+      (let ((id (car (last (pathname-directory sub)))))
+        (unless (and current (string= id current))
+          (unless (uiop:file-exists-p (merge-pathnames "events.jsonl" sub))
+            (let ((mtime (ignore-errors (file-write-date sub))))
+              (when (and mtime (> (- now mtime) *prune-min-age-seconds*))
+                (ignore-errors
+                 (uiop:delete-directory-tree sub :validate t
+                                                 :if-does-not-exist :ignore))))))))))
 
 (defun repl-new-session (agent)
   "开始一个新会话：把当前 agent 消息清空并绑定新 session id。
@@ -536,11 +619,20 @@
   "把 agent-messages 里尚未落盘的消息追加进当前会话（增量，事件日志式）。"
   (let ((s *repl-session*))
     (when (and s agent)
-      (let ((msgs (agent-cl.loop:agent-messages agent)))
+      (let ((msgs (agent-cl.loop:agent-messages agent))
+            (failed 0)
+            (first-error nil))
         (loop for m in (nthcdr (min *persisted-count* (length msgs)) msgs)
               do (handler-case
                      (agent-cl.session:persist-message s m)
-                   (error () nil)))
+                   (error (e)
+                     ;; Count instead of swallowing: a full disk or a locked
+                     ;; session file used to lose the whole turn in silence.
+                     (incf failed)
+                     (unless first-error (setf first-error e)))))
+        (when (plusp failed)
+          (format t "~&[session] 警告：~a 条消息未能写入会话（~a）：~a~%"
+                  failed (agent-cl.session:session-path s) first-error))
         (setf *persisted-count* (length msgs))))))
 
 (defun repl-session-line (s)
@@ -665,10 +757,10 @@
   (format t "  /quit 或 /exit 退出~%"))
 
 (defun repl-command (line agent)
-  (let* ((trim (string-trim '(#\Space #\Tab) line))
+  (let* ((trim (clean-input-line line))
          (sp (position #\Space trim))
          (cmd (if sp (subseq trim 0 sp) trim))
-         (rest (and sp (string-trim '(#\Space) (subseq trim (1+ sp))))))
+         (rest (and sp (string-trim '(#\Space #\Tab) (subseq trim (1+ sp))))))
     (cond
       ((string= cmd "/help") (print-help))
       ((string= cmd "/tools")
@@ -701,15 +793,17 @@
            ;; no argument: interactive picker
            (repl-use-interactive agent)))
       ((string= cmd "/plan")
-       (let ((f (and rest (find-symbol "RUN-PLANNED" "AGENT-CL.PLAN"))))
-         (if f
-             (handler-case
-                 (progn
-                   (funcall f agent rest #'repl-on-token)
-                   (flush-tokens))   ; 步骤流式残段此刻落屏，勿留到下一轮被 reset-tokens 丢弃
-               (error (e)
-                 (format t "~&[plan] 失败: ~a~%" e)))
-             (format t "~&/plan 不可用：scripts/plan.lisp 未加载~%"))))
+       (if (null rest)
+           (format t "~&用法: /plan <task>（需要一个任务描述）~%")
+           (let ((f (find-symbol "RUN-PLANNED" "AGENT-CL.PLAN")))
+             (if f
+                 (handler-case
+                     (progn
+                       (funcall f agent rest #'repl-on-token)
+                       (flush-tokens))   ; 步骤流式残段此刻落屏，勿留到下一轮被 reset-tokens 丢弃
+                   (error (e)
+                     (format t "~&[plan] 失败: ~a~%" e)))
+                 (format t "~&/plan 不可用：scripts/plan.lisp 未加载~%")))))
       ((string= cmd "/color")
        (setf *color* (not (and rest (string= rest "off"))))
        (format t "~&颜色: ~a~%" (if *color* "on" "off")))
@@ -772,12 +866,30 @@
       (t (format t "~&未知命令 ~a（/help 查看）~%" cmd)))))
 
 
+(defun slashed-name (path)
+  "PATH with native separators turned into '/', so a Windows cwd and a HOME
+  spelled with the other separator still compare equal."
+  (substitute #\/ #\\ (namestring path)))
+
 (defun current-workdir ()
-  "Working directory shown in the status bar. Shortens the user's home prefix to ~."
-  (let* ((cwd (namestring (uiop:getcwd)))
-         (home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME"))))
-    (if (and home (>= (length cwd) (length home))
-             (string-equal home (subseq cwd 0 (length home))))
+  "Working directory shown in the status bar. Shortens the user's home prefix
+  to ~.
+
+  The prefix test used to be a bare STRING-EQUAL over the first N characters, so
+  HOME=C:/Users/bob also matched C:/Users/bobby/... and the bar printed a
+  nonsense '~y/...'; it also compared native (backslash) strings against a HOME
+  that may be spelled with either separator."
+  (let* ((cwd (slashed-name (uiop:getcwd)))
+         (home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME")))
+         (home (and home (plusp (length home))
+                    (string-right-trim "/\\" (substitute #\/ #\\ home)))))
+    (if (and home
+             (>= (length cwd) (length home))
+             (string-equal home cwd :end1 (length home) :end2 (length home))
+             ;; the boundary must be a separator (or the whole path), never a
+             ;; shared prefix of a longer directory name
+             (or (= (length cwd) (length home))
+                 (char= (char cwd (length home)) #\/)))
         (concatenate 'string "~" (subseq cwd (length home)))
         cwd)))
 
@@ -957,6 +1069,32 @@
       (terpri))
   (finish-output))
 
+(defun footer-refresh-geometry ()
+  "Re-probe the console and, when the terminal was resized, re-pin the footer.
+  The footer's row/column numbers were captured once at enable time, so after a
+  resize the status bar padded to the OLD width and the cursor addressing pointed
+  at rows that no longer existed. Returns T when the geometry changed."
+  (when *footer*
+    (let ((cap (agent-cl.render:probe-console)))
+      (when (and cap (integerp (getf cap :cols)) (plusp (getf cap :cols)))
+        (let ((cols (getf cap :cols)) (rows (getf cap :rows)))
+          (when (or (/= cols (getf *footer* :cols))
+                    (/= rows (getf *footer* :rows)))
+            (let ((layout (agent-cl.render:footer-layout rows)))
+              (if layout
+                  (progn
+                    (setf *footer* (append (list :cols cols :rows rows
+                                                 :handle (getf cap :handle))
+                                           layout))
+                    (format t "~a" (agent-cl.render:set-scroll-region
+                                    (getf *footer* :scroll-top)
+                                    (getf *footer* :scroll-bottom)))
+                    (finish-output)
+                    t)
+                  ;; the screen became too short to pin a footer
+                  (footer-disable)
+                  nil))))))))
+
 (defun ask-turn (agent line)
   (unwind-protect
        (progn
@@ -997,28 +1135,41 @@
            (footer-enable)
            (when (footer-active-p)
              (format t "~&[repl] 状态栏与输入栏已固定在底部（/footer off 关闭）。~%"))
-           (loop
-             (if (footer-active-p)
-                 (progn (footer-draw-status agent) (footer-draw-prompt))
-                 (progn (render-status-bar agent)
-                        (format t "~&~a" *repl-prompt*)
-                        (finish-output)))
-             (let ((line (read-line *standard-input* nil :eof)))
-               (cond
-                 ;; EOF (stdin closed / piped input ended) -> exit
-                 ((eq line :eof)
-                  (when (footer-active-p) (footer-begin-output nil))
-                  (return))
-                 ;; blank line = no-op (SLIME-style): just re-prompt, never exit
-                 ((string= (string-trim '(#\Space #\Tab) line) "")
-                  (when (footer-active-p) (footer-begin-output nil)))
-                 (t
-                  ;; the transient input row is erased at the next prompt, so
-                  ;; copy the accepted line into the scrolling transcript
-                  (when (footer-active-p) (footer-begin-output line))
-                  (if (char= (char line 0) #\/)
-                      (repl-command line agent)
-                      (ask-turn agent line)))))))
+            (loop
+              ;; a resized terminal invalidates the pinned footer's geometry
+              (footer-refresh-geometry)
+              (if (footer-active-p)
+                  (progn (footer-draw-status agent) (footer-draw-prompt))
+                  (progn (render-status-bar agent)
+                         (format t "~&~a" *repl-prompt*)
+                         (finish-output)))
+              (let ((line (read-line *standard-input* nil :eof)))
+                (cond
+                  ;; EOF (stdin closed / piped input ended) -> exit
+                  ((eq line :eof)
+                   (when (footer-active-p) (footer-begin-output nil))
+                   (return))
+                  ;; blank line = no-op (SLIME-style): just re-prompt, never exit
+                  ((string= (clean-input-line line) "")
+                   (when (footer-active-p) (footer-begin-output nil)))
+                  (t
+                   ;; the transient input row is erased at the next prompt, so
+                   ;; copy the accepted line into the scrolling transcript
+                   (when (footer-active-p) (footer-begin-output line))
+                   (if (char= (char line 0) #\/)
+                       (repl-command line agent)
+                       (handler-case
+                           (ask-turn agent line)
+                         (sb-sys:interactive-interrupt ()
+                           ;; Ctrl-C DURING A TURN interrupts the turn — which is
+                           ;; what the banner promises. It used to fall through to
+                           ;; the outer handler and quit the whole REPL, throwing
+                           ;; away a live session. Ctrl-C at the prompt (where
+                           ;; READ-LINE is waiting) still exits.
+                           (agent-cl.loop:stop agent)
+                           (flush-tokens)
+                           (format t "~&[repl] 已中断本轮（会话保留；在提示符处 Ctrl-C 退出）。~%")
+                           (repl-persist-turn agent)))))))))
       ;; always hand the terminal back, including on Ctrl-C
       (footer-disable))
   ;; Ctrl-C 优雅退出（--script 下无调试器）

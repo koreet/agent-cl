@@ -58,22 +58,48 @@
         when (and nm (probe-file (merge-pathnames "events.jsonl" sub)))
           collect (string nm)))
 
+(defun valid-session-id-p (id)
+  "True when ID is a plain session directory name.
+
+  The /api/session handler interpolated the raw query parameter into a path, so
+  ?id=../../../Windows/win.ini climbed out of the sessions directory and served
+  any events.jsonl the process could read. Only the id characters we actually
+  generate are accepted, and the result must be one of the known ids."
+  (and (stringp id)
+       (plusp (length id))
+       (<= (length id) 64)
+       (every (lambda (c)
+                (or (alphanumericp c) (member c '(#\- #\_ #\.))))
+              id)
+       (not (member id '("." "..") :test #'string=))
+       ;; SEARCH, not FIND: FIND with a string needle and #'CHAR= is a type error
+       ;; (it signalled a 500 on every real session id)
+       (not (search ".." id))))
+
 (defun read-session (id)
-  (let ((f (merge-pathnames (concatenate 'string id "/events.jsonl")
-                            *sessions-dir*)))
-    (when (probe-file f)
-      (with-output-to-string (o)
-        (write-char #\[ o)
-        (let ((first t))
-          (with-open-file (in f :external-format :utf-8)
-            (loop for line = (read-line in nil nil) while line do
-              (handler-case
-                  (progn
-                    (unless first (write-char #\, o))
-                    (write-string line o)
-                    (setf first nil))
-                (error () nil)))))
-        (write-char #\] o)))))
+  "Re-encode the session's JSONL as a JSON array. Each line is PARSED and
+  re-encoded: the handler used to copy raw lines, so one invalid line made the
+  browser's JSON.parse fail and the whole session render as empty."
+  (when (valid-session-id-p id)
+    (let ((f (merge-pathnames (concatenate 'string id "/events.jsonl")
+                              *sessions-dir*)))
+      (when (probe-file f)
+        (with-output-to-string (o)
+          (write-char #\[ o)
+          (let ((first t))
+            (with-open-file (in f :external-format :utf-8)
+              (loop for line = (read-line in nil nil) while line do
+                (let ((trimmed (string-trim '(#\Return #\Space) line)))
+                  (unless (string= trimmed "")
+                    (handler-case
+                        (let ((json (agent-cl.core:json-encode
+                                     (agent-cl.core:json-decode trimmed))))
+                          (unless first (write-char #\, o))
+                          (write-string json o)
+                          (setf first nil))
+                      (error (e)
+                        (format t "~&[console] skip bad event line in ~a: ~a~%" id e)))))))
+          (write-char #\] o)))))))
 
 (define-easy-handler (home :uri "/") ()
   (setf (content-type*) "text/html; charset=utf-8")
@@ -123,6 +149,9 @@
 (if (uiop:getenv "AGENT_CONSOLE_SELFCHECK")
     ;; probe mode issued by the tooling: boot + readiness prints already shown;
     ;; never leave a lingering process in the agent's own context.
-    (sb-exit (progn (format t "SELFCHECK_OK_TO_QUIT~%") (finish-output)
-                    (ignore-errors (sb-ext:quit :unix-status 0))))
+    ;; NB: this used to call (SB-EXIT ...), an undefined function, so self-check
+    ;; mode raised "The function SB-EXIT is undefined" instead of quitting.
+    (progn (format t "SELFCHECK_OK_TO_QUIT~%")
+           (finish-output)
+           (ignore-errors (sb-ext:quit :unix-status 0)))
     (loop (sleep 60)))

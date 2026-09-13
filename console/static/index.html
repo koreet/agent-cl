@@ -109,12 +109,16 @@ function bubbleFor(ev){
   inner.appendChild(b); row.appendChild(w); row.appendChild(inner);
   // collapsible for long code-heavy body
   const lines=(ev.content||'').split('\n').length;
+  // NB: a plain text tool result has NO <pre> element. Unguarded, pre.style threw
+  // a TypeError, which aborted the whole forEach in openCurrent() and left the
+  // session half-rendered. Fall back to the bubble itself, which is pre-wrap.
   const pre=b.querySelector('pre');
+  const target=pre||b;
   if((ev.role==='assistant'&&lines>8)||ev.role==='tool'){
-    pre.style.maxHeight='180px'; pre.style.overflow='hidden';
+    target.style.maxHeight='180px'; target.style.overflow='hidden';
     const cb=document.createElement('span'); cb.className='colb'; cb.textContent='(长 '+lines+' 行 · 展开)';
-    cb.onclick=()=>{ const open= pre.style.maxHeight!=='none';
-      pre.style.maxHeight= open?'none':'180px'; pre.style.overflow= open?'auto':'hidden';
+    cb.onclick=()=>{ const open= target.style.maxHeight!=='none';
+      target.style.maxHeight= open?'none':'180px'; target.style.overflow= open?'auto':'hidden';
       cb.textContent= open?'(收起)':'(长 '+lines+' 行 · 展开)'; };
     b.appendChild(cb);
   }
@@ -131,7 +135,8 @@ async function openCurrent(){
   if(!id) return;
   let data=[]; try{ const r=await fetch('/api/session?id='+encodeURIComponent(id)); data=await r.json(); }catch(e){}
   if(!Array.isArray(data)){ $('msgs').innerHTML='<div id="start">读取失败 '+esc(data&&data.error)+'</div>'; return; }
-  data.forEach(ev=> $('msgs').appendChild(bubbleFor(ev)));
+  // one malformed event must not abort the rest of the session
+  data.forEach(ev=>{ try{ $('msgs').appendChild(bubbleFor(ev)); }catch(e){ console.error('render event failed', e, ev); } });
   $('msgs').scrollTop=$('msgs').scrollHeight;
 }
 $('sel').onchange=openCurrent;
