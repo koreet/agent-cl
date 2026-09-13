@@ -598,3 +598,34 @@
     (is-equal :error status)
     (ok (search "dexador" content)))
   (unregister-tool "web.search"))
+
+
+;;;; ---- usage accounting split (prompt / completion / total) -----------
+(deftest agent-usage-splits-prompt-and-completion
+  (let* ((tr (make-mock-transport :script nil))
+         (a  (make-agent :transport tr :tools nil)))
+    ;; start clean
+    (is-equal 0 (agent-cl.loop:agent-usage-total a))
+    (is-equal 0 (agent-cl.loop:agent-usage-prompt a))
+    (is-equal 0 (agent-cl.loop:agent-usage-completion a))
+    ;; feed two usages; total derived per-call
+    (agent-cl.loop:add-usage a '(:prompt-tokens 100 :completion-tokens 20 :total-tokens 120))
+    (agent-cl.loop:add-usage a '(:prompt-tokens 50  :completion-tokens 10 :total-tokens 60))
+    (is-equal 150 (agent-cl.loop:agent-usage-prompt a))
+    (is-equal 30  (agent-cl.loop:agent-usage-completion a))
+    (is-equal 180 (agent-cl.loop:agent-usage-total a))))
+
+(deftest agent-usage-total-falls-back-to-sum
+  ;; when the provider omits :total-tokens, total = prompt + completion
+  (let* ((tr (make-mock-transport :script nil))
+         (a  (make-agent :transport tr :tools nil)))
+    (agent-cl.loop:add-usage a '(:prompt-tokens 7 :completion-tokens 3))
+    (is-equal 7  (agent-cl.loop:agent-usage-prompt a))
+    (is-equal 3  (agent-cl.loop:agent-usage-completion a))
+    (is-equal 10 (agent-cl.loop:agent-usage-total a))))
+
+(deftest agent-usage-ignores-nil
+  (let* ((tr (make-mock-transport :script nil))
+         (a  (make-agent :transport tr :tools nil)))
+    (agent-cl.loop:add-usage a nil)
+    (is-equal 0 (agent-cl.loop:agent-usage-total a))))

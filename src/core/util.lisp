@@ -16,11 +16,21 @@
 (defun string-empty-p (s)
   (or (null s) (string= s "")))
 
+(defun fresh-random-state ()
+  "A randomly seeded random-state. SBCL's default *random-state* is seeded
+  deterministically at startup, so two processes (and repeated calls with the
+  default) produce the SAME sequence — which made every session id collide. Use
+  SB-EXT:SEED-RANDOM-STATE T for a real per-call seed; fall back to
+  *random-state* on other implementations."
+  #+sbcl (sb-ext:seed-random-state t)
+  #-sbcl *random-state*)
+
 (defun uuid-string ()
   "Random v4-ish UUID string, RFC-4122 shaped. Cryptography not needed for ids."
-  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
+  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8)))
+        (rs (fresh-random-state)))
     (dotimes (i 16)
-      (setf (aref bytes i) (random 256)))
+      (setf (aref bytes i) (random 256 rs)))
     (setf (aref bytes 6) (logand (aref bytes 6) #x0f))
     (setf (aref bytes 6) (logior (aref bytes 6) #x40))
     (setf (aref bytes 8) (logand (aref bytes 8) #x3f))

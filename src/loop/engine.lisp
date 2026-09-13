@@ -82,7 +82,10 @@
    (context-budget  :initarg :context-budget :initform nil :accessor agent-context-budget)
    (compactor       :initarg :compactor :initform nil :accessor agent-compactor)
    (stopped    :initform nil :accessor agent-stopped-p)
-   (usage-total :initform 0 :accessor agent-usage-total)))
+   (usage-total :initform 0 :accessor agent-usage-total)
+   ;; prompt/completion split so the UI can show "↑in ↓out =total"
+   (usage-prompt     :initform 0 :accessor agent-usage-prompt)
+   (usage-completion :initform 0 :accessor agent-usage-completion)))
 
 (defun make-agent (&key transport model (tools :all) policy messages memory system guard
                        max-steps max-history context-budget compactor)
@@ -231,9 +234,15 @@
       content))
 
 (defun add-usage (agent usage)
+  "Accumulate USAGE onto the agent: total, plus the prompt/completion split.
+  Missing components count as 0; total is derived from the provider when given."
   (when usage
-    (incf (agent-usage-total agent)
-          (or (agent-cl.llm:usage-total-tokens usage) 0))))
+    (let ((p (or (agent-cl.llm:usage-prompt-tokens usage) 0))
+          (c (or (agent-cl.llm:usage-completion-tokens usage) 0)))
+      (incf (agent-usage-prompt agent) p)
+      (incf (agent-usage-completion agent) c)
+      (incf (agent-usage-total agent)
+            (or (agent-cl.llm:usage-total-tokens usage) (+ p c))))))
 
 (defvar *extra-guards* nil
   "Alist (name . function) of user guard rules registered by defguard.")

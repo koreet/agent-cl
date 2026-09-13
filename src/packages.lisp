@@ -116,10 +116,12 @@
    #:make-agent
    #:agent-transport #:agent-model #:agent-tools #:agent-policy #:agent-messages #:agent-system
    #:agent-memory #:agent-max-steps #:agent-guard #:agent-usage-total #:agent-max-history #:agent-context-budget #:agent-compactor
+   #:agent-usage-prompt #:agent-usage-completion
    #:policy
    #:make-policy #:policy-max-steps #:policy-temperature #:policy-max-tool-results
    #:policy-parallel-tools #:policy-allow-model-retry #:policy-max-tokens
    #:run #:ask #:stop
+   #:add-usage
    #:guard-failed
    #:register-guard #:check-extra-guards #:*extra-guards*
    ;; CLOS extension hooks
@@ -223,5 +225,13 @@
    #:fence-open-p #:fence-close-p
    ;; deterministic state-classification (pure)
    #:classify-block #:classify-lines #:classify-one
-   #:+fence-out+ #:+fence-in+))
+   #:+fence-out+ #:+fence-in+
+   ;; pure heading + inline-span core (ANSI codes passed in as a theme plist)
+   #:classify-heading #:render-inline* #:osc8-wrap #:*osc8-links*
+   #:classify-list-item
+   ;; table alignment (pure)
+   #:string-display-width #:wide-char-p #:pad-to-width
+   #:parse-table-row #:separator-row-p #:format-table-block
+   ;; heading decoration (pure): underline + SGR selection
+   #:*heading-rule-width* #:heading-rule #:heading-ansi #:heading-rule-color))
 

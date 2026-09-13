@@ -151,30 +151,17 @@
 (defun esc (n) (format nil "~c[~am" #\Escape n))
 (defun ansi (n text) (if *color* (format nil "~a~a~a" (esc n) text (esc 0)) text))
 
+(defun inline-theme ()
+  "Build the ANSI theme plist fed to the pure renderer, honouring *color*.
+  When colour is off the theme is NIL, which makes agent-cl.render:render-inline*
+  strip the markdown markers and return plain text — the NO_COLOR fallback."
+  (when *color*
+    (list :bold "1" :code "36" :link "4")))
+
 (defun render-inline (text)
-  "**粗体** 与 `行内代码` 的最小 ANSI 着色。"
-  (if (null *color*)
-      text
-      (let ((out (make-string-output-stream))
-            (i 0) (n (length text)) (bold nil))
-        (loop while (< i n)
-              do (cond
-                   ((and (< (1+ i) n)
-                         (char= (char text i) #\*)
-                         (char= (char text (1+ i)) #\*))
-                    (setf bold (not bold))
-                    (write-string (if bold (esc 1) (esc 0)) out)
-                    (incf i 2))
-                   ((char= (char text i) #\`)
-                    (write-string (esc 32) out)
-                    (incf i)
-                    (loop while (and (< i n) (not (char= (char text i) #\`)))
-                          do (write-char (char text i) out) (incf i))
-                    (write-string (esc 0) out)
-                    (when (< i n) (incf i)))     ; 跳过闭合反引号
-                   (t (write-char (char text i) out) (incf i))))
-        (when bold (write-string (esc 0) out))   ; 未闭合 ** 也要复位，防终端残留加粗
-        (get-output-stream-string out))))
+  "Render **bold** / `code` / [link](url) via the pure, tested core.
+  Thin adapter: choose the theme from *color*, delegate to agent-cl.render."
+  (agent-cl.render:render-inline* text (inline-theme)))
 
 ;;;; repl.lisp RENDER-SECTION PATCH (surgical replacement, kept readable)
 ;;;; Replaces the old global-*md-state* line renderer with one driven by the
@@ -227,22 +214,88 @@
   (and (plusp (length line))
        (>= (count #\| line) 2)))
 
-;;;; --- ordinary (non-fenced) inline decoration, as before -------------
+;;;; --- ordinary (non-fenced) line decoration ---------------------------
+(defun emit-heading (level text)
+  "Render a heading (text already inline-rendered) at LEVEL. Styling decisions
+  (SGR code, underline) come from the pure agent-cl.render core; this only
+  prints. H1 gets a leading blank line and a heavy underline, H2 a light one."
+  (let ((code (and *color* (agent-cl.render:heading-ansi level)))
+        (col  (and *color* (agent-cl.render:heading-rule-color level)))
+        (line (agent-cl.render:heading-rule level)))
+    (when (= level 1) (format t "~%"))            ; breathing room above H1
+    (format t "~a~%"
+            (if code
+                (format nil "~c[~am~a~c[0m" #\Escape code text #\Escape)
+                text))
+    (when (plusp (length line))
+      (format t "~a~%"
+              (if *color*
+                  (format nil "~c[~am~a~c[0m" #\Escape col line #\Escape)
+                  line)))))
+
+(defun render-heading-line (level text)
+  "Emit a heading, styled by LEVEL. Uses the pure classify-heading result;
+  the marker (#) itself is not printed. Falls back to plain when *color* is off."
+  (emit-heading level (render-inline text)))
+
+(defun horizontal-rule-p (trim)
+  "True for a markdown horizontal rule: 3+ of the same -, * or _ (allowing spaces)."
+  (and (>= (length trim) 3)
+       (let ((c (char trim 0)))
+         (and (member c '(#\- #\* #\_))
+              (every (lambda (ch) (or (char= ch c) (char= ch #\Space))) trim)
+              (>= (count c trim) 3)))))
+
+(defvar *table-buf* nil
+  "Pending table rows (list of cell-lists) accumulated until the table ends.
+  Tables must be buffered whole because column widths need every row up front.")
+
+(defun flush-table ()
+  "Emit any buffered table as an aligned block, then clear the buffer.
+  Header (first row) is bolded when colour is on. No-op when empty."
+  (when *table-buf*
+    (let* ((rows (nreverse *table-buf*))
+           (lines (agent-cl.render:format-table-block rows)))
+      (loop for line in lines
+            for first = t then nil
+            do (format t "~a~%"
+                       (if (and first *color*)
+                           (ansi 1 line)       ; bold header
+                           line))))
+    (setf *table-buf* nil)))
+
+(defun render-list-item (kind indent ltext)
+  "Emit a list item. Bullets show a coloured '•'; ordered items keep their own
+  number (ltext is 'N. body'). INDENT leading spaces are preserved so nesting
+  reads as indentation."
+  (let ((pad (make-string indent :initial-element #\Space)))
+    (if (eq kind :bullet)
+        (format t "~a~a ~a~%" pad
+                (if *color* (ansi 36 "•") "•")
+                (render-inline ltext))
+        (format t "~a~a~%" pad (render-inline ltext)))))
+
 (defun render-ordinary-line (line)
-  "普通行的装饰：标题加粗 / 表格品红 / 列表或其它默认。"
+  "普通行的装饰：标题分级 / 水平线 / 列表 / 表格（缓冲对齐）/ 其它默认。"
   (let ((trim (string-trim '(#\Space #\Tab #\Return) line)))
-    (cond
-      ((and (plusp (length trim)) (char= (char trim 0) #\#))
-       (format t "~a~%" (render-inline (ansi 1 line))))
-      ((table-row-p trim)
-       (format t "~a~%" (ansi 35 (render-inline line))))
-      ((and (plusp (length trim))
-            (member (char trim 0) '(#\- #\* #\+))
-            (or (= (length trim) 1)
-                (and (> (length trim) 1)
-                     (char= (char trim 1) #\Space))))
-       (format t "~a~%" (render-inline line)))
-      (t (format t "~a~%" (render-inline line))))))
+    (multiple-value-bind (hlevel htext) (agent-cl.render:classify-heading line)
+      (cond
+        ((plusp hlevel) (flush-table) (render-heading-line hlevel htext))
+        ((horizontal-rule-p trim)
+         (flush-table)
+         (format t "~a~%" (if *color*
+                              (ansi 90 (make-string 40 :initial-element #\-))
+                              (make-string 40 :initial-element #\-))))
+        (t
+         (multiple-value-bind (lkind lindent ltext)
+             (agent-cl.render:classify-list-item line)
+           (cond
+             ((eq lkind :bullet)  (flush-table) (render-list-item :bullet lindent ltext))
+             ((eq lkind :ordered) (flush-table) (render-list-item :ordered lindent ltext))
+             ((table-row-p trim)
+              ;; buffer this row; the whole table is emitted at once later
+              (push (agent-cl.render:parse-table-row line) *table-buf*))
+             (t (flush-table) (format t "~a~%" (render-inline line))))))))))
 
 ;;;; --- classify + emit one logical line -------------------------------
 (defun render-one-md-line (kind line)
@@ -262,6 +315,9 @@
       (multiple-value-bind (st md)
           (agent-cl.render:classify-one *fence* line)
         (setf *fence* st)
+        ;; a fence opens/closes: any pending table must be flushed first
+        (when (member (agent-cl.render:md-line-kind md) '(:fence-start :fence-end))
+          (flush-table))
         (render-one-md-line (agent-cl.render:md-line-kind md)
                             (agent-cl.render:md-line-text md))))
   *fence*)
@@ -284,14 +340,16 @@
 ;;;; --- streaming buffer (complete lines are flushed as they arrive) -----
 (defvar *tok-buf* (make-string-output-stream))
 (defun reset-tokens ()
-  "开始一轮：清空缓冲，并把围栏状态归零（避免跨回合残留）。"
+  "开始一轮：清空缓冲，并把围栏状态与表格缓冲归零（避免跨回合残留）。"
   (setf *tok-buf* (make-string-output-stream))
-  (setf *fence* :fence-out))
+  (setf *fence* :fence-out)
+  (setf *table-buf* nil))
 (defun flush-tokens ()
-  "回合结束：把缓冲里未成行的残片当一行处理，然后归零围栏状态。"
+  "回合结束：冲刷未成行的残片与待输出的表格，然后归零围栏状态。"
   (let ((rest (get-output-stream-string *tok-buf*)))
     (when (plusp (length rest))
       (advance-fence-with-line rest)))
+  (flush-table)                      ; 表格在回合结束时收尾
   (setf *fence* :fence-out)          ; 回合结束强制合拢，屏障跨回合泄漏
   (terpri)
   (finish-output))
@@ -386,8 +444,19 @@
 (defvar *persisted-count* 0
   "已写入当前会话的消息条数（增量持久用）。")
 
+(defun prune-empty-sessions ()
+  "Delete session directories that contain no events.jsonl. These come from
+  sessions that were created but never written to (e.g. a repl started and
+  exited without a real turn); they hold no user data, only clutter the list."
+  (let ((root (session-root)))
+    (dolist (sub (uiop:subdirectories root))
+      (unless (uiop:file-exists-p (merge-pathnames "events.jsonl" sub))
+        (ignore-errors (uiop:delete-directory-tree sub :validate t :if-does-not-exist :ignore))))))
+
 (defun repl-new-session (agent)
-  "开始一个新会话：把当前 agent 消息清空并绑定新 session id。"
+  "开始一个新会话：把当前 agent 消息清空并绑定新 session id。
+  新建后立即写入一条 session-start checkpoint，使会话马上落盘、出现在
+  /sessions 列表里（否则只建目录不写文件，用户看不到它）。"
   (when (and agent *repl-session*)
     ;; 先把旧会话落一个 checkpoint，便于审计结束点
     (handler-case
@@ -397,6 +466,10 @@
                         :directory (session-root)))
   (setf *persisted-count* 0)
   (when agent (setf (agent-cl.loop:agent-messages agent) nil))
+  ;; materialise the session so it shows up immediately in /sessions
+  (handler-case
+      (agent-cl.session:save-checkpoint *repl-session* "session-start")
+    (error () nil))
   (format t "~&[session] 新会话 ~a~%" (agent-cl.session:session-id *repl-session*))
   *repl-session*)
 
@@ -468,6 +541,8 @@
   (format t "  /sessions      列出已保存会话~%")
   (format t "  /use <id>      切换到指定会话（继续之前的对话）~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
+  (format t "  /usage         显示模型 / token 用量 / 工作路径~%")
+  (format t "  /demo          markdown 渲染 + 状态栏自检~%")
   (format t "  /engine new|legacy  渲染引擎新/旧（旧=无代码围栏高亮）~%")
   (format t "  /plan <task>    Plan-then-Execute：拆步骤→逐步执行→汇总~%")
   (format t "  /quit 或 /exit 退出~%"))
@@ -511,6 +586,37 @@
       ((string= cmd "/color")
        (setf *color* (not (and rest (string= rest "off"))))
        (format t "~&颜色: ~a~%" (if *color* "on" "off")))
+      ((string= cmd "/usage")
+       (format t "~&模型: ~a~%  提示(^): ~a tokens~%  生成(v): ~a tokens~%  合计: ~a tokens~%  工作路径: ~a~%"
+               (agent-cl.loop:agent-model agent)
+               (agent-cl.loop:agent-usage-prompt agent)
+               (agent-cl.loop:agent-usage-completion agent)
+               (agent-cl.loop:agent-usage-total agent)
+               (current-workdir)))
+      ((string= cmd "/demo")
+       (format t "~&── markdown 渲染自检（引擎: ~a）──~%" *engine*)
+       (dolist (l '("# 一级标题"
+                    "## 二级标题"
+                    "### 三级标题"
+                    "普通段落，含 **加粗** 与 `行内代码`，还有 [可点链接](https://example.com)。"
+                    "- 无序项 A"
+                    "- 无序项 B"
+                    "  - 嵌套子项 B1"
+                    "1. 有序第一"
+                    "2. 有序第二"
+                    "---"
+                    "| 名称 | 类型 | 用量 | 状态 |"
+                    "| --- | --- | --- | --- |"
+                    "| read | tool | 12 | ok |"
+                    "| parser.lisp | file | 340 | ok |"
+                    "| web.search | tool | 1 | fail |"
+                    "表格后的一行普通文本。"
+                    "```lisp"
+                    "(defun hello () (format t \"hi\"))"
+                    "```"))
+         (advance-fence-with-line l))
+       (flush-tokens)
+       (render-status-bar agent))
       ((string= cmd "/engine")
        (cond
          ((and rest (string= rest "new")) (setf *engine* :new))
@@ -523,6 +629,31 @@
        (uiop:quit 0))
       (t (format t "~&未知命令 ~a（/help 查看）~%" cmd)))))
 
+
+(defun current-workdir ()
+  "Working directory shown in the status bar. Shortens the user's home prefix to ~."
+  (let* ((cwd (namestring (uiop:getcwd)))
+         (home (or (uiop:getenv "USERPROFILE") (uiop:getenv "HOME"))))
+    (if (and home (>= (length cwd) (length home))
+             (string-equal home (subseq cwd 0 (length home))))
+        (concatenate 'string "~" (subseq cwd (length home)))
+        cwd)))
+
+(defun render-status-bar (agent)
+  "Print a one-line status bar after a turn: model | token split | working dir.
+  Kept short and dim so it does not compete with the answer text."
+  (let ((model (agent-cl.loop:agent-model agent))
+        (pin   (agent-cl.loop:agent-usage-prompt agent))
+        (pout  (agent-cl.loop:agent-usage-completion agent))
+        (tot   (agent-cl.loop:agent-usage-total agent))
+        (dir   (current-workdir)))
+    (format t "~&  ~a ~a | ~a ~a ~a | ~a~%"
+            (ansi 90 "──")                       ; dim rule
+            (ansi 36 (format nil "~a" model))
+            (ansi 32 (format nil "^~a" pin))     ; prompt tokens (in)
+            (ansi 33 (format nil "v~a" pout))    ; completion tokens (out)
+            (ansi 90 (format nil "=~a tok" tot))
+            (ansi 90 dir))))
 
 (defun ask-turn (agent line)
   (unwind-protect
@@ -546,7 +677,8 @@
                                (agent-cl.loop:guard-reason summary))))
                (error (e2)
                  (format t "~&agent> [error] ~a~%" e2))))))
-    ;; 每轮结束把本轮新消息（含 user 提问与工具往返）持久化到当前会话
+    ;; 每轮结束：打印状态栏（模型 / token / 工作路径），并持久化本轮消息
+    (render-status-bar agent)
     (repl-persist-turn agent)))
 
 ;; ---------------------------------------------------------------------------
@@ -554,18 +686,21 @@
 ;; ---------------------------------------------------------------------------
 (handler-case
     (let ((agent (make-repl-agent)))
+      (prune-empty-sessions)          ; 清掉"建了没写"的空会话目录
       (repl-new-session agent)
-      (format t "~&Agent-CL REPL — 输入任务；/help 查看命令；空行退出；Ctrl-C 中断。~%")
+      (format t "~&Agent-CL REPL — 输入任务；/help 查看命令；/quit 退出；Ctrl-C 中断。~%")
       (format t "流式输出 + Markdown 着色已启用（/color off 关闭）。~%")
       (loop
         (format t "~&you> ")
         (finish-output)
         (let ((line (read-line *standard-input* nil :eof)))
-          (when (or (eq line :eof) (string= (string-trim '(#\Space #\Tab) line) ""))
-            (return))
-          (if (and (plusp (length line)) (char= (char line 0) #\/))
-              (repl-command line agent)
-              (ask-turn agent line)))))
+          (cond
+            ;; EOF (stdin closed / piped input ended) -> exit
+            ((eq line :eof) (return))
+            ;; blank line = no-op (SLIME-style): just re-prompt, never exit
+            ((string= (string-trim '(#\Space #\Tab) line) "") nil)
+            ((char= (char line 0) #\/) (repl-command line agent))
+            (t (ask-turn agent line))))))
   ;; Ctrl-C 优雅退出（--script 下无调试器）
   (sb-sys:interactive-interrupt ()
     (format t "~&[repl] 已退出（Ctrl-C）。~%")
