@@ -179,3 +179,41 @@
   "Timestamp of the last event, or NIL."
   (let ((last (first (last (session-events session)))))
     (and last (getf last :TS))))
+
+;;; ---------------------------------------------------------------------------
+;;; interactive session selection (pure)
+;;; ---------------------------------------------------------------------------
+
+(defun resolve-session-choice (choice ids)
+  "Resolve a user CHOICE against the ordered list of session IDS.
+  Returns (values ID STATUS):
+    CHOICE may be a 1-based index (\"3\"), a full id, or a unique id prefix.
+    STATUS = :ok          -> ID is the pick
+             :none        -> blank / no match
+             :ambiguous   -> prefix matched more than one id (ID = nil)
+             :out-of-range-> numeric pick out of [1, N]
+  Pure: no IO, no printing — the caller drives any prompt."
+  (let* ((raw (string-trim '(#\Space #\Tab #\Return) (or choice ""))))
+    (cond
+      ((zerop (length raw)) (values nil :none))
+      ;; numeric pick: all digits
+      ((every #'digit-char-p raw)
+       (let ((n (parse-integer raw)))
+         (if (and (>= n 1) (<= n (length ids)))
+             (values (nth (1- n) ids) :ok)
+             (values nil :out-of-range))))
+      (t
+       ;; exact match first
+       (let ((exact (find raw ids :test #'string-equal)))
+         (if exact
+             (values exact :ok)
+             ;; unique prefix match
+             (let ((hits (remove-if-not
+                          (lambda (id) (and (>= (length id) (length raw))
+                                            (string-equal raw id
+                                                          :end1 (length raw)
+                                                          :end2 (length raw))))
+                          ids)))
+               (cond ((= (length hits) 1) (values (first hits) :ok))
+                     ((> (length hits) 1)  (values nil :ambiguous))
+                     (t                    (values nil :none))))))))))

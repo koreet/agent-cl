@@ -193,7 +193,8 @@
    #:session-append #:session-replay #:open-session #:save-checkpoint
    #:persist-message #:replayed-messages #:message->event #:event->message
    #:session-ids #:load-session #:session-first-user-text
-   #:session-message-count #:session-last-ts))
+   #:session-message-count #:session-last-ts
+   #:resolve-session-choice))
 
 (defpackage #:agent-cl
   (:use #:cl)

@@ -496,20 +496,49 @@
             (agent-cl.session:session-id s) n preview
             (or ts ""))))
 
+(defun sorted-session-ids ()
+  "Session ids, most-recently-active first (falls back to id order)."
+  (let ((ids (agent-cl.session:session-ids (session-root))))
+    (sort ids #'string> :key (lambda (id)
+                               (handler-case
+                                   (or (agent-cl.session:session-last-ts
+                                        (agent-cl.session:load-session
+                                         id :directory (session-root)))
+                                       "")
+                                 (error () ""))))))
+
 (defun repl-list-sessions ()
-  "列出 ~/.agent-cl/sessions 下全部会话。"
-  (let ((ids (sort (agent-cl.session:session-ids (session-root)) #'string>)))
+  "List sessions with an index so they can be picked by number. Returns the
+  ordered id list (same order as printed)."
+  (let ((ids (sorted-session-ids)))
     (if ids
         (progn
           (format t "~&已保存会话（共 ~a 个）：~%" (length ids))
-          (dolist (id ids)
-            (handler-case
-                (let ((s (agent-cl.session:load-session
-                          id :directory (session-root))))
-                  (format t "  ~a~%" (repl-session-line s)))
-              (error (e)
-                (format t "  ~a  [读取失败: ~a]~%" id e)))))
-        (format t "~&还没有已保存的会话。~%"))))
+          (loop for id in ids for i from 1
+                do (handler-case
+                       (let ((s (agent-cl.session:load-session
+                                 id :directory (session-root))))
+                         (format t "  ~2d) ~a~%" i (repl-session-line s)))
+                     (error (e)
+                       (format t "  ~2d) ~a  [读取失败: ~a]~%" i id e)))))
+        (format t "~&还没有已保存的会话。~%"))
+    ids))
+
+(defun repl-use-interactive (agent)
+  "Prompt for a session by number/id/prefix (like /use but interactive)."
+  (let ((ids (repl-list-sessions)))
+    (when ids
+      (format t "选择会话编号（直接回车取消）: ")
+      (finish-output)
+      (let* ((line (read-line *standard-input* nil :eof))
+             (line (if (eq line :eof) "" (string-trim '(#\Space #\Tab) line))))
+        (multiple-value-bind (id status)
+            (agent-cl.session:resolve-session-choice line ids)
+          (case status
+            (:ok          (repl-use-session agent id))
+            (:none        (format t "~&[session] 已取消。~%"))
+            (:ambiguous   (format t "~&[session] 前缀匹配到多个会话，请用编号或完整 id。~%"))
+            (:out-of-range (format t "~&[session] 编号超出范围（1..~a）。~%" (length ids)))))))))
 
 (defun repl-use-session (agent id)
   "切换到 ID 会话：先存当前会话，再载入目标历史续聊。"
@@ -539,7 +568,7 @@
   (format t "  /load <file>   载入 JSONL 会话继续对话~%")
   (format t "  /new           另起新会话（当前自动存档）~%")
   (format t "  /sessions      列出已保存会话~%")
-  (format t "  /use <id>      切换到指定会话（继续之前的对话）~%")
+  (format t "  /use [编号|id|前缀]  切换会话；不带参数则交互选择~%")
   (format t "  /color on|off  开/关 ANSI 颜色~%")
   (format t "  /usage         显示模型 / token 用量 / 工作路径~%")
   (format t "  /demo          markdown 渲染 + 状态栏自检~%")
@@ -571,8 +600,18 @@
       ((string= cmd "/sessions")
        (repl-list-sessions))
       ((string= cmd "/use")
-       (if rest (repl-use-session agent rest)
-           (format t "~&用法: /use <session-id>（/sessions 查看）~%")))
+       (if (and rest (plusp (length rest)))
+           ;; explicit pick: number / unique id prefix / full id
+           (let ((ids (sorted-session-ids)))
+             (multiple-value-bind (id status)
+                 (agent-cl.session:resolve-session-choice rest ids)
+               (case status
+                 (:ok           (repl-use-session agent id))
+                 (:none         (format t "~&[session] 未找到匹配：~a~%" rest))
+                 (:ambiguous    (format t "~&[session] 前缀匹配到多个会话：~a~%" rest))
+                 (:out-of-range (format t "~&[session] 编号超出范围（1..~a）。~%" (length ids))))))
+           ;; no argument: interactive picker
+           (repl-use-interactive agent)))
       ((string= cmd "/plan")
        (let ((f (and rest (find-symbol "RUN-PLANNED" "AGENT-CL.PLAN"))))
          (if f

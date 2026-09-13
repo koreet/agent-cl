@@ -98,3 +98,41 @@
       (is-equal (+ (length history) 2) (length (agent-messages agent2)))))
   (unregister-tool "test.square")
   (uiop:delete-directory-tree (uiop:ensure-directory-pathname (tmp-session-dir)) :validate t :if-does-not-exist :ignore))
+
+
+;;;; resolve-session-choice (pure picker logic) --------------------------
+(deftest session-choose-by-index
+  (let ((ids '("aaaa-1111" "bbbb-2222" "cccc-3333")))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "2" ids)
+      (is-equal "bbbb-2222" id) (is-equal :ok st))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "1" ids)
+      (is-equal "aaaa-1111" id) (is-equal :ok st))))
+
+(deftest session-choose-out-of-range
+  (let ((ids '("aaaa-1111" "bbbb-2222")))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "5" ids)
+      (is-equal nil id) (is-equal :out-of-range st))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "0" ids)
+      (is-equal nil id) (is-equal :out-of-range st))))
+
+(deftest session-choose-by-full-id
+  (let ((ids '("aaaa-1111" "bbbb-2222")))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "aaaa-1111" ids)
+      (is-equal "aaaa-1111" id) (is-equal :ok st))))
+
+(deftest session-choose-by-prefix
+  (let ((ids '("aaaa-1111" "bbbb-2222" "ab99-0000")))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "bbbb" ids)
+      (is-equal "bbbb-2222" id) (is-equal :ok st))))
+
+(deftest session-choose-ambiguous-prefix
+  (let ((ids '("aaaa-1111" "aabb-2222")))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "aa" ids)
+      (is-equal nil id) (is-equal :ambiguous st))))
+
+(deftest session-choose-blank-and-nomatch
+  (let ((ids '("aaaa-1111")))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "" ids)
+      (is-equal nil id) (is-equal :none st))
+    (multiple-value-bind (id st) (agent-cl.session:resolve-session-choice "zzz" ids)
+      (is-equal nil id) (is-equal :none st))))
